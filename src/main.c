@@ -1,7 +1,7 @@
 /*
- * PAINT.APP - a Mode-1 paint/drawing app (#114).
+ * PAINT.APP - a GEOBENCH paint/drawing app (#114).
  *
- * The editable canvas is a 100x100 Mode-1 bitmap buffer. Normal 100x100 .PIC files
+ * The editable canvas is a 100x100 packed bitmap buffer. Normal 100x100 .PIC files
  * use it as the whole document; larger banked .PIC files open in a view mode, then
  * Edit/Select loads a selected area into that buffer and Save writes it back through
  * GB_PICEDIT before saving the full picture.
@@ -15,10 +15,13 @@
  *   raw picture bytes. Save writes either the small in-page canvas or the whole
  *   banked picture after committing the current tile.
  *
- * Pixel addressing: Mode-1 packs 4 px per byte; pixel i has bit0 @ 7-i, bit1 @ 3-i
- * (same as ICONED). gb_my is pixel-accurate (rows); gb_mxp gives the pixel x (#114,
- * gb_mx only resolves to the byte column). A kernel-MANAGED window (gb_wm_managed; the
- * WM owns the frame/title/close/drag) - p_draw/p_frame/p_click/p_drag/p_close, like
+ * Pixel addressing: CPC Mode-1 packs pixel i with bit0 @ 7-i, bit1 @ 3-i
+ * (same as ICONED). MSX2/PCW store the canvas in Screen-6 pen-space bytes. PCW
+ * gb_restorerect writes raw CGA2 hardware bytes, so display paths permute rows
+ * on the way to the screen while keeping saved .PIC data in portable mode 6.
+ * gb_my is pixel-accurate (rows); gb_mxp gives the pixel x (#114, gb_mx only
+ * resolves to the byte column). A kernel-MANAGED window (gb_wm_managed; the WM
+ * owns the frame/title/close/drag) - p_draw/p_frame/p_click/p_drag/p_close, like
  * apps/iconed/main.c (#146).
  */
 #include "gb.h"
@@ -35,7 +38,7 @@
 #define SB_W      3                     /* vertical scrollbar width, byte cols   */
 #define HSB_H     7                     /* horizontal scrollbar height, rows     */
 
-#ifdef GB_MSX2
+#if defined(GB_MSX2) || defined(GB_PCW)
 #define WHITE_BYTE 0x55                 /* 4 px of pen 1 (white), Screen-6 packing */
 #else
 #define WHITE_BYTE 0xF0                 /* 4 px of pen 1 (white) - the blank canvas */
@@ -76,9 +79,9 @@ static unsigned char tc_x = 64, tc_y = 28;
 #define SW_WB 3                                      /* swatch width in bytes    */
 #define WID_Y (unsigned char)(PAL_Y + PAL_H + 2)     /* pencil-width control row */
 
-/* .PIC v2 = a 14-byte header then the Mode-1 canvas, all in one buffer so Save/Load
+/* .PIC v2 = a 14-byte header then the packed canvas, all in one buffer so Save/Load
    are a single fs call (#114):
-     0  "GBPC" magic     4  version = 2     5  mode = 1 (Mode-1, 4 colours)
+     0  "GBPC" magic     4  version = 2     5  mode (1=Mode-1, 6=Screen-6)
      6  width_px (2, LE) 8  height_px (2, LE)
      10 inks[4]          pen 0..3 -> CPC hardware ink (the picture's palette)
   14 canvas bytes (width_px/4 stride * height rows) */
@@ -138,12 +141,40 @@ static void p_close(void);
 static unsigned char ist[IST_MAX];
 static unsigned char ist_ok = 0;       /* a valid GBIS set with >=N_TOOLS icons? */
 
-/* ---- Mode-1 pixel packing (pixel i: bit0 @ 7-i, bit1 @ 3-i) ------------------ */
+#ifdef GB_PCW
+static unsigned char rowbuf[CANVAS_WB];
+
+static unsigned char pcw_raw_byte(unsigned char b)
+{
+    return (unsigned char)(((b & 0x55) << 1) | (((b ^ 0xFF) & 0xAA) >> 1));
+}
+
+static void restore_packed(unsigned char x, unsigned char y, unsigned char w,
+                           unsigned char rows, const unsigned char *src,
+                           unsigned char stride)
+{
+    unsigned char r, c, n, left, dx;
+    for (r = 0; r < rows; r++) {
+        left = w;
+        dx = 0;
+        while (left) {
+            n = (left > CANVAS_WB) ? CANVAS_WB : left;
+            for (c = 0; c < n; c++) rowbuf[c] = pcw_raw_byte(src[dx + c]);
+            gb_restorerect((unsigned char)(x + dx), (unsigned char)(y + r), n, 1, rowbuf);
+            dx = (unsigned char)(dx + n);
+            left = (unsigned char)(left - n);
+        }
+        src += stride;
+    }
+}
+#endif
+
+/* ---- packed pixel helpers --------------------------------------------------- */
 /* Replace pixel i's pen: clear its two bits first, else drawing over a non-zero
    pen blends (e.g. pen 2 over white pen 1 -> pen 3 red). */
 static unsigned char set_pixel(unsigned char b, unsigned char i, unsigned char p)
 {
-#ifdef GB_MSX2
+#if defined(GB_MSX2) || defined(GB_PCW)
     unsigned char sh = (unsigned char)(6 - (i << 1));   /* Screen 6: pen in bits 7-2i,6-2i */
     b &= (unsigned char)~(3 << sh);
     b |= (unsigned char)((p & 3) << sh);
@@ -180,7 +211,7 @@ static void load_tools(void)
               ist[3] == 'S' && ist[4] == 2 && ist[5] >= N_TOOLS);
 }
 
-#ifdef GB_MSX2
+#if defined(GB_MSX2) || defined(GB_PCW)
 static void load_picedit_helper(void) {}
 #else
 static void load_picedit_helper(void)
@@ -218,20 +249,31 @@ static unsigned char tool_y(unsigned char k) { return (unsigned char)(TCY + (k >
 static void blit_row(unsigned char row)
 {
     gb_curhide();
+#ifdef GB_PCW
+    restore_packed(CVX, (unsigned char)(CVY + row), edit_wb, 1,
+                   canvas + (unsigned int)row * CANVAS_WB, CANVAS_WB);
+#else
     gb_restorerect(CVX, (unsigned char)(CVY + row), edit_wb, 1,
                    canvas + (unsigned int)row * CANVAS_WB);
+#endif
     gb_curshow();
 }
 
 /* render the whole canvas */
 static void blit_canvas(void)
 {
+#ifndef GB_PCW
     unsigned char y;
+#endif
     gb_curhide();
+#ifdef GB_PCW
+    restore_packed(CVX, CVY, edit_wb, edit_ph, canvas, CANVAS_WB);
+#else
     if (edit_wb == CANVAS_WB) gb_restorerect(CVX, CVY, edit_wb, edit_ph, canvas);
     else for (y = 0; y < edit_ph; y++)
         gb_restorerect(CVX, (unsigned char)(CVY + y), edit_wb, 1,
                        canvas + (unsigned int)y * CANVAS_WB);
+#endif
     gb_curshow();
 }
 
@@ -306,7 +348,7 @@ static void do_undo(void)               /* swap canvas <-> snapshot (so Undo red
 static unsigned char get_pen(unsigned char x, unsigned char y)
 {
     unsigned char b = canvas[(unsigned int)y * CANVAS_WB + (x >> 2)], i = (unsigned char)(x & 3);
-#ifdef GB_MSX2
+#if defined(GB_MSX2) || defined(GB_PCW)
     return (unsigned char)((b >> (6 - (i << 1))) & 3);
 #else
     return (unsigned char)(((b >> (7 - i)) & 1) | (((b >> (3 - i)) & 1) << 1));
@@ -528,12 +570,22 @@ static void blit_pic(unsigned char x, unsigned char y, unsigned char w,
     unsigned char r = 0;
     if (!w || !rows) return;
     if (w == pic_wb && !banked2) {
+#ifdef GB_PCW
+        if (!banked && src + (unsigned int)w * rows <= pic_file_len)
+            restore_packed(x, y, w, rows, picbuf + src, pic_wb);
+#else
         if (banked) { PIC_PAGE_K = banked; PIC_PAGE2_K = 0; gb_pic_blit(x, y, w, rows, src); }
         else if (src + (unsigned int)w * rows <= pic_file_len)
             gb_restorerect(x, y, w, rows, picbuf + src);
+#endif
         return;
     }
     while (r < rows) {
+#ifdef GB_PCW
+        if (!banked && src + w <= pic_file_len) {
+            restore_packed(x, (unsigned char)(y + r), w, 1, picbuf + src, pic_wb);
+        }
+#else
         if (banked) {
             PIC_PAGE_K = banked;
             PIC_PAGE2_K = banked2;
@@ -541,6 +593,7 @@ static void blit_pic(unsigned char x, unsigned char y, unsigned char w,
         } else if (src + w <= pic_file_len) {
             gb_restorerect(x, (unsigned char)(y + r), w, 1, picbuf + src);
         }
+#endif
         src += pic_wb;
         r++;
     }
@@ -958,6 +1011,7 @@ static void load_current_picture(void)
     got = gb_fs_load((char *)picbuf, PIC_MAX);
     if (parse_picbuf(got)) { dirty = 0; return; }
 
+#ifndef GB_PCW
     load_picedit_helper();
     banked = gb_pic_open();
     UI_MODAL_K = 0;                      /* picture loader reuses UI scratch */
@@ -982,6 +1036,7 @@ static void load_current_picture(void)
         dirty = 0;
         return;
     }
+#endif
 
     reset_editable_picture();
     canvas_clear();
@@ -999,7 +1054,7 @@ static unsigned int p_save(void)
 {
     picbuf[0] = 'G'; picbuf[1] = 'B'; picbuf[2] = 'P'; picbuf[3] = 'C';
     picbuf[4] = 2;                       /* version */
-#ifdef GB_MSX2
+#if defined(GB_MSX2) || defined(GB_PCW)
     picbuf[5] = 6;                       /* mode 6 = V9938 Screen 6 packing (#287) */
 #else
     picbuf[5] = 1;                       /* mode 1 (4 colours) */
