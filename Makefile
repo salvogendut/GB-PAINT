@@ -29,7 +29,6 @@ PCW_APPFILE := $(PCW_BUILD)/$(APP).APP
 PCW_IST_S6 := $(PCW_BUILD)/$(APP)-S6.IST
 PCW_IST := $(PCW_BUILD)/$(APP).IST
 PCW_DSK := $(DIST)/GB-PAINT-PCW.DSK
-PCW_SAMPLE_DIR := $(PCW_BUILD)/samples
 
 PAINT_TOOLS := \
 	assets/paint/pencil.asm \
@@ -43,8 +42,6 @@ SAMPLES := \
 	samples/PENGUIN.PIC \
 	samples/TLEUNG.PIC \
 	samples/LOGO.PIC
-
-PCW_SAMPLES := $(patsubst samples/%,$(PCW_SAMPLE_DIR)/%,$(SAMPLES))
 
 REL := \
 	$(BUILD)/crt0.rel \
@@ -88,7 +85,7 @@ check-sdk:
 	@test -x "$$(command -v $(SDCC))" || { echo "sdcc not found"; exit 1; }
 	@test -x "$$(command -v $(RASM))" || { echo "rasm not found"; exit 1; }
 
-$(BUILD) $(DIST) $(PCW_BUILD) $(PCW_SAMPLE_DIR):
+$(BUILD) $(DIST) $(PCW_BUILD):
 	mkdir -p $@
 
 $(BUILD)/crt0.rel: $(GB)/crt0.s | $(BUILD)
@@ -169,18 +166,15 @@ $(PCW_IST_S6): $(PAINT_TOOLS) $(GEOBENCH)/tools/packicons.py | $(PCW_BUILD)
 $(PCW_IST): $(PCW_IST_S6) tools/pcw_rawify.py
 	$(PYTHON) tools/pcw_rawify.py ist $< $@
 
-$(PCW_SAMPLE_DIR)/%.PIC: samples/%.PIC $(GEOBENCH)/tools/pic_to_msx.py | $(PCW_SAMPLE_DIR)
-	$(PYTHON) $(GEOBENCH)/tools/pic_to_msx.py $< $@
-
-$(PCW_DSK): $(PCW_APPFILE) $(PCW_IST) $(PCW_SAMPLES) $(GEOBENCH)/tools/mkpcwdsk.py | $(DIST)
+$(PCW_DSK): $(PCW_APPFILE) $(PCW_IST) $(SAMPLES) $(GEOBENCH)/tools/mkpcwdsk.py | $(DIST)
 	rm -f $@
 	$(PYTHON) $(GEOBENCH)/tools/mkpcwdsk.py $@ \
 		--add $(PCW_APPFILE)=PAINT.APP \
 		--add $(PCW_IST)=PAINT.IST \
-		--add $(PCW_SAMPLE_DIR)/464.PIC=464.PIC \
-		--add $(PCW_SAMPLE_DIR)/PENGUIN.PIC=PENGUIN.PIC \
-		--add $(PCW_SAMPLE_DIR)/TLEUNG.PIC=TLEUNG.PIC \
-		--add $(PCW_SAMPLE_DIR)/LOGO.PIC=LOGO.PIC
+		--add samples/464.PIC=464.PIC \
+		--add samples/PENGUIN.PIC=PENGUIN.PIC \
+		--add samples/TLEUNG.PIC=TLEUNG.PIC \
+		--add samples/LOGO.PIC=LOGO.PIC
 
 clean:
 	rm -rf $(BUILD) $(DIST)
