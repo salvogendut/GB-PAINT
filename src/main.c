@@ -286,9 +286,15 @@ static void draw_toolchest(void)
     gb_frame(tc_x, tc_y, TC_WIN_W, TC_WIN_H, 2);
     gb_text((unsigned char)(tc_x + 1), (unsigned char)(tc_y + 2), "Tools");
     if (ist_ok)
-        for (k = 0; k < N_TOOLS; k++)
+        for (k = 0; k < N_TOOLS; k++) {
+#if defined(GB_MSX2) || defined(GB_PCW)
+            restore_packed(tool_x(k), tool_y(k), tool_wb(k), tool_h(k),
+                           ist + tool_off(k), tool_wb(k));
+#else
             gb_restorerect(tool_x(k), tool_y(k), tool_wb(k), tool_h(k),
                            ist + tool_off(k));
+#endif
+        }
     gb_frame(tool_x(tool), tool_y(tool), TOOL_WB, TOOL_H, 3);   /* selected: red */
 
     for (k = 0; k < 4; k++)
