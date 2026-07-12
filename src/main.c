@@ -15,10 +15,9 @@
  *   raw picture bytes. Save writes either the small in-page canvas or the whole
  *   banked picture after committing the current tile.
  *
- * Pixel addressing: CPC Mode-1 packs pixel i with bit0 @ 7-i, bit1 @ 3-i
- * (same as ICONED). MSX2/PCW store the canvas in Screen-6 pen-space bytes. PCW
- * gb_restorerect writes raw CGA2 hardware bytes, so display paths permute rows
- * on the way to the screen while keeping saved .PIC data in portable mode 6.
+ * Pixel addressing is always the portable CPC Mode-1 layout: pixel i has bit0
+ * at 7-i and bit1 at 3-i. MSX2/PCW translate rows only while displaying them,
+ * so canvas, undo, banked tiles, and saved .PIC files stay byte-identical.
  * gb_my is pixel-accurate (rows); gb_mxp gives the pixel x (#114, gb_mx only
  * resolves to the byte column). A kernel-MANAGED window (gb_wm_managed; the WM
  * owns the frame/title/close/drag) - p_draw/p_frame/p_click/p_drag/p_close, like
@@ -38,11 +37,7 @@
 #define SB_W      3                     /* vertical scrollbar width, byte cols   */
 #define HSB_H     7                     /* horizontal scrollbar height, rows     */
 
-#if defined(GB_MSX2) || defined(GB_PCW)
-#define WHITE_BYTE 0x55                 /* 4 px of pen 1 (white), Screen-6 packing */
-#else
 #define WHITE_BYTE 0xF0                 /* 4 px of pen 1 (white) - the blank canvas */
-#endif
 
 /* ---- tools (PAINT.IST icon order: pencil,square,circle,fill,undo) ----------- */
 #define TOOL_PENCIL 0
@@ -81,7 +76,7 @@ static unsigned char tc_x = 64, tc_y = 28;
 
 /* .PIC v2 = a 14-byte header then the packed canvas, all in one buffer so Save/Load
    are a single fs call (#114):
-     0  "GBPC" magic     4  version = 2     5  mode (1=Mode-1, 6=Screen-6)
+     0  "GBPC" magic     4  version = 2     5  mode (1=canonical Mode-1)
      6  width_px (2, LE) 8  height_px (2, LE)
      10 inks[4]          pen 0..3 -> CPC hardware ink (the picture's palette)
   14 canvas bytes (width_px/4 stride * height rows) */
@@ -141,29 +136,40 @@ static void p_close(void);
 static unsigned char ist[IST_MAX];
 static unsigned char ist_ok = 0;       /* a valid GBIS set with >=N_TOOLS icons? */
 
-#ifdef GB_PCW
-static unsigned char rowbuf[CANVAS_WB];
+#if defined(GB_MSX2) || defined(GB_PCW)
+#define picrow ((unsigned char *)gb_copybuf + CANVAS_WB * CANVAS_H)
 
-static unsigned char pcw_raw_byte(unsigned char b)
+#ifdef GB_PCW
+static unsigned char native_pic_byte(unsigned char b)
 {
-    return (unsigned char)(((b & 0x55) << 1) | (((b ^ 0xFF) & 0xAA) >> 1));
+    unsigned char i, p, out = 0;
+    for (i = 0; i < 4; i++) {
+        p = (unsigned char)(((b >> (7 - i)) & 1) | (((b >> (3 - i)) & 1) << 1));
+        out |= (unsigned char)(p << (6 - 2 * i));
+    }
+    out = (unsigned char)(((out & 0x55) << 1) | (((out ^ 0xFF) & 0xAA) >> 1));
+    return out;
 }
+#endif
 
 static void restore_packed(unsigned char x, unsigned char y, unsigned char w,
                            unsigned char rows, const unsigned char *src,
                            unsigned char stride)
 {
-    unsigned char r, c, n, left, dx;
+    unsigned char r;
+#ifdef GB_PCW
+    unsigned char c;
+#endif
     for (r = 0; r < rows; r++) {
-        left = w;
-        dx = 0;
-        while (left) {
-            n = (left > CANVAS_WB) ? CANVAS_WB : left;
-            for (c = 0; c < n; c++) rowbuf[c] = pcw_raw_byte(src[dx + c]);
-            gb_restorerect((unsigned char)(x + dx), (unsigned char)(y + r), n, 1, rowbuf);
-            dx = (unsigned char)(dx + n);
-            left = (unsigned char)(left - n);
-        }
+#ifdef GB_MSX2
+        gb_pic_edit_buf = (unsigned int)src;
+        gb_pic_edit_off = (unsigned int)picrow;
+        FS_SAVE_LEN_K = w;
+        if (!gb_pic_edit(GB_PICEDIT_NATIVE)) return;
+#else
+        for (c = 0; c < w; c++) picrow[c] = native_pic_byte(src[c]);
+#endif
+        gb_restorerect(x, (unsigned char)(y + r), w, 1, picrow);
         src += stride;
     }
 }
@@ -174,17 +180,10 @@ static void restore_packed(unsigned char x, unsigned char y, unsigned char w,
    pen blends (e.g. pen 2 over white pen 1 -> pen 3 red). */
 static unsigned char set_pixel(unsigned char b, unsigned char i, unsigned char p)
 {
-#if defined(GB_MSX2) || defined(GB_PCW)
-    unsigned char sh = (unsigned char)(6 - (i << 1));   /* Screen 6: pen in bits 7-2i,6-2i */
-    b &= (unsigned char)~(3 << sh);
-    b |= (unsigned char)((p & 3) << sh);
-    return b;
-#else
     b &= (unsigned char)~((1 << (7 - i)) | (1 << (3 - i)));
     if (p & 1) b |= (unsigned char)(1 << (7 - i));
     if (p & 2) b |= (unsigned char)(1 << (3 - i));
     return b;
-#endif
 }
 
 static void canvas_clear(void)         /* New: blank to white (pen 1) */
@@ -249,7 +248,7 @@ static unsigned char tool_y(unsigned char k) { return (unsigned char)(TCY + (k >
 static void blit_row(unsigned char row)
 {
     gb_curhide();
-#ifdef GB_PCW
+#if defined(GB_MSX2) || defined(GB_PCW)
     restore_packed(CVX, (unsigned char)(CVY + row), edit_wb, 1,
                    canvas + (unsigned int)row * CANVAS_WB, CANVAS_WB);
 #else
@@ -262,11 +261,11 @@ static void blit_row(unsigned char row)
 /* render the whole canvas */
 static void blit_canvas(void)
 {
-#ifndef GB_PCW
+#if !defined(GB_MSX2) && !defined(GB_PCW)
     unsigned char y;
 #endif
     gb_curhide();
-#ifdef GB_PCW
+#if defined(GB_MSX2) || defined(GB_PCW)
     restore_packed(CVX, CVY, edit_wb, edit_ph, canvas, CANVAS_WB);
 #else
     if (edit_wb == CANVAS_WB) gb_restorerect(CVX, CVY, edit_wb, edit_ph, canvas);
@@ -348,11 +347,7 @@ static void do_undo(void)               /* swap canvas <-> snapshot (so Undo red
 static unsigned char get_pen(unsigned char x, unsigned char y)
 {
     unsigned char b = canvas[(unsigned int)y * CANVAS_WB + (x >> 2)], i = (unsigned char)(x & 3);
-#if defined(GB_MSX2) || defined(GB_PCW)
-    return (unsigned char)((b >> (6 - (i << 1))) & 3);
-#else
     return (unsigned char)(((b >> (7 - i)) & 1) | (((b >> (3 - i)) & 1) << 1));
-#endif
 }
 static void cpix(unsigned char x, unsigned char y)            /* in-bounds set (fill) */
 {
@@ -570,30 +565,28 @@ static void blit_pic(unsigned char x, unsigned char y, unsigned char w,
     unsigned char r = 0;
     if (!w || !rows) return;
     if (w == pic_wb && !banked2) {
-#ifdef GB_PCW
-        if (!banked && src + (unsigned int)w * rows <= pic_file_len)
+        if (banked) { PIC_PAGE_K = banked; PIC_PAGE2_K = 0; gb_pic_blit(x, y, w, rows, src); }
+        else if (src + (unsigned int)w * rows <= pic_file_len) {
+#if defined(GB_MSX2) || defined(GB_PCW)
             restore_packed(x, y, w, rows, picbuf + src, pic_wb);
 #else
-        if (banked) { PIC_PAGE_K = banked; PIC_PAGE2_K = 0; gb_pic_blit(x, y, w, rows, src); }
-        else if (src + (unsigned int)w * rows <= pic_file_len)
             gb_restorerect(x, y, w, rows, picbuf + src);
 #endif
+        }
         return;
     }
     while (r < rows) {
-#ifdef GB_PCW
-        if (!banked && src + w <= pic_file_len) {
-            restore_packed(x, (unsigned char)(y + r), w, 1, picbuf + src, pic_wb);
-        }
-#else
         if (banked) {
             PIC_PAGE_K = banked;
             PIC_PAGE2_K = banked2;
             gb_pic_blit(x, (unsigned char)(y + r), w, 1, src);
         } else if (src + w <= pic_file_len) {
+#if defined(GB_MSX2) || defined(GB_PCW)
+            restore_packed(x, (unsigned char)(y + r), w, 1, picbuf + src, pic_wb);
+#else
             gb_restorerect(x, (unsigned char)(y + r), w, 1, picbuf + src);
-        }
 #endif
+        }
         src += pic_wb;
         r++;
     }
@@ -976,6 +969,7 @@ static unsigned char parse_picbuf(unsigned int got)
         return 0;
     if (picbuf[4] == 2) {
         if (got < PIC_HDR) return 0;
+        if (picbuf[5] != 1) return 0;        /* banked legacy mode-6 files normalize in the kernel */
         w = (unsigned char)picbuf[6] | ((unsigned int)(unsigned char)picbuf[7] << 8);
         pic_wb = (unsigned char)((w + 3) >> 2);
         pic_h = (unsigned char)picbuf[8] | ((unsigned int)(unsigned char)picbuf[9] << 8);
@@ -1054,11 +1048,7 @@ static unsigned int p_save(void)
 {
     picbuf[0] = 'G'; picbuf[1] = 'B'; picbuf[2] = 'P'; picbuf[3] = 'C';
     picbuf[4] = 2;                       /* version */
-#if defined(GB_MSX2) || defined(GB_PCW)
-    picbuf[5] = 6;                       /* mode 6 = V9938 Screen 6 packing (#287) */
-#else
-    picbuf[5] = 1;                       /* mode 1 (4 colours) */
-#endif
+    picbuf[5] = 1;                       /* canonical portable Mode-1 packing */
     picbuf[6] = CANVAS_W; picbuf[7] = 0; /* width_px  = 100 */
     picbuf[8] = CANVAS_H; picbuf[9] = 0; /* height_px = 100 */
     picbuf[10] = pic_inks[0]; picbuf[11] = pic_inks[1];

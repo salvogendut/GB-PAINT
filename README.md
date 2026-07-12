@@ -7,7 +7,7 @@ companion disk images containing:
 
 - `PAINT.APP`
 - `PAINT.IST` with the five toolchest icons currently used by the app
-- a small sample `.PIC` set that fits on a CPC/PCW data disk
+- a small portable `.PIC` sample set that fits on a CPC/PCW data disk
 
 The full Paint tool artwork lives under `assets/paint/`, with the source sheet
 at `assets/paint-tools.png`. It is kept here with Paint because it is app-specific
@@ -56,6 +56,11 @@ with GEOBENCH's `tools/mkpcwdsk.py`.
 The disk includes `PAINT.IST` because Paint loads its toolchest icons at runtime.
 GEOBENCH shared modules such as `GBUI.MOD` are expected to come from the boot
 GEOBENCH system media.
+
+Paint keeps its canvas in GEOBENCH's canonical GBPC v2 Mode-1 packing and saves
+the same byte representation on CPC, MSX2, and PCW. MSX2 and PCW translate only
+the rows sent to their displays, so the sample `.PIC` files are packaged
+byte-for-byte on both standalone disks.
 
 The PCW build edits normal 100x100 pictures. Large banked pictures are opened
 view-only on CPC/MSX; on PCW they are reported as too large because GEOBENCH's
