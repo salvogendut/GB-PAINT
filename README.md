@@ -57,6 +57,10 @@ The disk includes `PAINT.IST` because Paint loads its toolchest icons at runtime
 GEOBENCH shared modules such as `GBUI.MOD` are expected to come from the boot
 GEOBENCH system media.
 
+`PAINT.IST` uses GEOBENCH's portable canonical Mode-1 encoding and is identical
+on CPC, MSX2, and PCW. Paint converts only the tool-icon rows sent to a non-CPC
+display, just as it does for its picture canvas.
+
 Paint keeps its canvas in GEOBENCH's canonical GBPC v2 Mode-1 packing and saves
 the same byte representation on CPC, MSX2, and PCW. MSX2 and PCW translate only
 the rows sent to their displays, so the sample `.PIC` files are packaged

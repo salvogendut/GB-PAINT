@@ -26,8 +26,6 @@ PACK_STAMP := $(PACK_DIR)/.stamp
 PCW_BUILD := $(BUILD)/pcw
 PCW_RAW := $(PCW_BUILD)/$(APP).RAW
 PCW_APPFILE := $(PCW_BUILD)/$(APP).APP
-PCW_IST_S6 := $(PCW_BUILD)/$(APP)-S6.IST
-PCW_IST := $(PCW_BUILD)/$(APP).IST
 PCW_DSK := $(DIST)/GB-PAINT-PCW.DSK
 
 PAINT_TOOLS := \
@@ -74,7 +72,7 @@ app-pcw: $(PCW_APPFILE)
 
 assets: $(IST)
 
-assets-pcw: $(PCW_IST)
+assets-pcw: $(IST)
 
 dsk: $(DSK)
 
@@ -160,17 +158,11 @@ $(PCW_RAW): $(PCW_BUILD)/app.bin
 $(PCW_APPFILE): $(PCW_RAW)
 	cp $< $@
 
-$(PCW_IST_S6): $(PAINT_TOOLS) $(GEOBENCH)/tools/packicons.py | $(PCW_BUILD)
-	$(PYTHON) $(GEOBENCH)/tools/packicons.py --platform msx2 $@ $(PAINT_TOOLS)
-
-$(PCW_IST): $(PCW_IST_S6) tools/pcw_rawify.py
-	$(PYTHON) tools/pcw_rawify.py ist $< $@
-
-$(PCW_DSK): $(PCW_APPFILE) $(PCW_IST) $(SAMPLES) $(GEOBENCH)/tools/mkpcwdsk.py | $(DIST)
+$(PCW_DSK): $(PCW_APPFILE) $(IST) $(SAMPLES) $(GEOBENCH)/tools/mkpcwdsk.py | $(DIST)
 	rm -f $@
 	$(PYTHON) $(GEOBENCH)/tools/mkpcwdsk.py $@ \
 		--add $(PCW_APPFILE)=PAINT.APP \
-		--add $(PCW_IST)=PAINT.IST \
+		--add $(IST)=PAINT.IST \
 		--add samples/464.PIC=464.PIC \
 		--add samples/PENGUIN.PIC=PENGUIN.PIC \
 		--add samples/TLEUNG.PIC=TLEUNG.PIC \
