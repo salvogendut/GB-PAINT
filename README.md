@@ -13,6 +13,20 @@ The full Paint tool artwork lives under `assets/paint/`, with the source sheet
 at `assets/paint-tools.png`. It is kept here with Paint because it is app-specific
 source material; the standalone DSK only ships the packed runtime `PAINT.IST`.
 
+The application follows the same source layout as GEOBENCH and GB-BASIC:
+`apps/paint/` contains `main.c`, the libgb symbol manifest, and its app-owned
+icons. `apps/paint/icon.asm` is the canonical four-colour fallback and
+`apps/paint/icon16.asm` is the native MSX Screen-7 variant. GEOBENCH's MSX
+build embeds both resources in a GBAP v2 header; CPC and PCW builds embed only
+the portable four-colour icon.
+
+Edit either canonical source with GEOBENCH's Python Icon Editor:
+
+```sh
+../geobench/tools/iconedit.py apps/paint/icon.asm
+../geobench/tools/iconedit.py apps/paint/icon16.asm
+```
+
 ## Build
 
 By default the Makefile expects the GEOBENCH checkout next to this repo:
