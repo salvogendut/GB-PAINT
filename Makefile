@@ -4,17 +4,28 @@ BUILD := build
 DIST := dist
 
 GB := $(GEOBENCH)/lib/gb
-SRC := src/main.c
+APP_DIR := apps/paint
+SRC := $(APP_DIR)/main.c
 DATA_LOC ?= 0x72B0
 PCW_DATA_LOC ?= 0x7290
 APPDEFS ?=
 
 SDCC ?= sdcc
 SDCC_BIN := $(dir $(shell command -v $(SDCC)))
+GBLIB_TOOL := $(GEOBENCH)/tools/gblib_subset.py
+GBLIB_SYMBOLS := $(APP_DIR)/gblib.symbols
+GBLIB_SUBSET := $(BUILD)/gblib_paint.s
 SDAS ?= $(SDCC_BIN)sdasz80
 MAKEBIN ?= $(SDCC_BIN)makebin
 RASM ?= rasm
 PYTHON ?= python3
+
+APP_ICON := $(APP_DIR)/icon.asm
+APP_ICON16 := $(APP_DIR)/icon16.asm
+ICON_TOOL := $(GEOBENCH)/tools/embed_app_icon.py
+CODE_LOC := 0x4110
+LINKED_RAW := $(BUILD)/$(APP)-linked.RAW
+PCW_LINKED_RAW = $(PCW_BUILD)/$(APP)-linked.RAW
 
 RAW := $(BUILD)/$(APP).RAW
 APPFILE := $(BUILD)/$(APP).APP
@@ -55,8 +66,8 @@ PCW_REL := \
 	$(PCW_BUILD)/gbui_stub.rel \
 	$(PCW_BUILD)/gblib.rel
 
-CFLAGS := -mz80 --fomit-frame-pointer $(APPDEFS) -I $(GB)
-PCW_CFLAGS := -mz80 --fomit-frame-pointer -DGB_PCW $(APPDEFS) -I $(GB)
+CFLAGS := -mz80 --opt-code-size --max-allocs-per-node 100000 --fomit-frame-pointer $(APPDEFS) -I $(GB)
+PCW_CFLAGS := -mz80 --opt-code-size --max-allocs-per-node 100000 --fomit-frame-pointer -DGB_PCW $(APPDEFS) -I $(GB)
 
 .PHONY: all cpc pcw app app-pcw dsk dsk-pcw assets assets-pcw clean check-sdk
 
@@ -89,27 +100,33 @@ $(BUILD) $(DIST) $(PCW_BUILD):
 $(BUILD)/crt0.rel: $(GB)/crt0.s | $(BUILD)
 	$(SDAS) -o $@ $<
 
-$(BUILD)/gblib.rel: $(GB)/gblib.s | $(BUILD)
+$(GBLIB_SUBSET): $(GB)/gblib.s $(GBLIB_TOOL) $(GBLIB_SYMBOLS) | $(BUILD)
+	$(PYTHON) $(GBLIB_TOOL) $(GB)/gblib.s $@ $(GBLIB_SYMBOLS)
+
+$(BUILD)/gblib.rel: $(GBLIB_SUBSET) | $(BUILD)
 	$(SDAS) -o $@ $<
 
-$(BUILD)/main.rel: $(SRC) $(GB)/gb.h | $(BUILD)
+$(BUILD)/main.rel: $(SRC) $(GB)/gb.h Makefile | $(BUILD)
 	$(SDCC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/gbwin.rel: $(GB)/gbwin.c $(GB)/gb.h | $(BUILD)
-	$(SDCC) $(CFLAGS) -c $< -o $@
+$(BUILD)/gbwin.rel: $(GB)/gbwin.c $(GB)/gb.h Makefile | $(BUILD)
+	$(SDCC) $(CFLAGS) -DGBWIN_DRAG_ONLY -c $< -o $@
 
-$(BUILD)/gbui_stub.rel: $(GB)/gbui_stub.c $(GB)/gb.h | $(BUILD)
+$(BUILD)/gbui_stub.rel: $(GB)/gbui_stub.c $(GB)/gb.h Makefile | $(BUILD)
 	$(SDCC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/app.ihx: check-sdk $(REL)
-	$(SDCC) -mz80 --no-std-crt0 --code-loc 0x4000 --data-loc $(DATA_LOC) $(REL) -o $@
+	$(SDCC) -mz80 --opt-code-size --no-std-crt0 --code-loc $(CODE_LOC) --data-loc $(DATA_LOC) $(REL) -o $@
 	$(PYTHON) tools/check_fit.py $(BUILD)/app.map $(DATA_LOC) $(APP)
 
 $(BUILD)/app.bin: $(BUILD)/app.ihx
 	$(MAKEBIN) -p $< $@
 
-$(RAW): $(BUILD)/app.bin
+$(LINKED_RAW): $(BUILD)/app.bin
 	tail -c +16385 $< > $@
+
+$(RAW): $(LINKED_RAW) $(APP_ICON) $(ICON_TOOL)
+	$(PYTHON) $(ICON_TOOL) inject $(APP_ICON) $(LINKED_RAW) $@
 
 $(APPFILE): $(RAW)
 	cp $< $@
@@ -133,27 +150,30 @@ $(DSK): $(PACK_STAMP) $(APPFILE) $(IST) $(SAMPLES) | $(DIST)
 $(PCW_BUILD)/crt0.rel: $(GB)/crt0.s | $(PCW_BUILD)
 	$(SDAS) -o $@ $<
 
-$(PCW_BUILD)/gblib.rel: $(GB)/gblib.s | $(PCW_BUILD)
+$(PCW_BUILD)/gblib.rel: $(GBLIB_SUBSET) | $(PCW_BUILD)
 	$(SDAS) -o $@ $<
 
-$(PCW_BUILD)/main.rel: $(SRC) $(GB)/gb.h | $(PCW_BUILD)
+$(PCW_BUILD)/main.rel: $(SRC) $(GB)/gb.h Makefile | $(PCW_BUILD)
 	$(SDCC) $(PCW_CFLAGS) -c $< -o $@
 
-$(PCW_BUILD)/gbwin.rel: $(GB)/gbwin.c $(GB)/gb.h | $(PCW_BUILD)
-	$(SDCC) $(PCW_CFLAGS) -c $< -o $@
+$(PCW_BUILD)/gbwin.rel: $(GB)/gbwin.c $(GB)/gb.h Makefile | $(PCW_BUILD)
+	$(SDCC) $(PCW_CFLAGS) -DGBWIN_DRAG_ONLY -c $< -o $@
 
-$(PCW_BUILD)/gbui_stub.rel: $(GB)/gbui_stub.c $(GB)/gb.h | $(PCW_BUILD)
+$(PCW_BUILD)/gbui_stub.rel: $(GB)/gbui_stub.c $(GB)/gb.h Makefile | $(PCW_BUILD)
 	$(SDCC) $(PCW_CFLAGS) -c $< -o $@
 
 $(PCW_BUILD)/app.ihx: check-sdk $(PCW_REL)
-	$(SDCC) -mz80 --no-std-crt0 --code-loc 0x4000 --data-loc $(PCW_DATA_LOC) $(PCW_REL) -o $@
+	$(SDCC) -mz80 --opt-code-size --no-std-crt0 --code-loc $(CODE_LOC) --data-loc $(PCW_DATA_LOC) $(PCW_REL) -o $@
 	$(PYTHON) tools/check_fit.py $(PCW_BUILD)/app.map $(PCW_DATA_LOC) $(APP)-PCW
 
 $(PCW_BUILD)/app.bin: $(PCW_BUILD)/app.ihx
 	$(MAKEBIN) -p $< $@
 
-$(PCW_RAW): $(PCW_BUILD)/app.bin
+$(PCW_LINKED_RAW): $(PCW_BUILD)/app.bin
 	tail -c +16385 $< > $@
+
+$(PCW_RAW): $(PCW_LINKED_RAW) $(APP_ICON) $(ICON_TOOL)
+	$(PYTHON) $(ICON_TOOL) inject $(APP_ICON) $(PCW_LINKED_RAW) $@
 
 $(PCW_APPFILE): $(PCW_RAW)
 	cp $< $@
