@@ -1,5 +1,5 @@
-gb_text
 gb_textbw
+gb_window
 gb_restorerect
 gb_mxp
 gb_ui
@@ -14,7 +14,8 @@ gb_flags
 gb_fs_load
 gb_fs_save
 gb_getkey
-gb_menu
+gb_clip_set
+gb_clip_get
 gb_set_name
 gb_get_name
 gb_pic_open
@@ -22,11 +23,5 @@ gb_pic_blit
 gb_pic_edit
 gb_pic_close
 gb_restore_parent
-gb_wm_damage
-gb_wm_managed
-gb_wm_x
-gb_wm_y
-gb_wm_w
-gb_wm_h
+gb_wm_add
 gb_wm_close
-gb_wm_setpos

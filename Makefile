@@ -6,8 +6,8 @@ DIST := dist
 GB := $(GEOBENCH)/lib/gb
 APP_DIR := apps/paint
 SRC := $(APP_DIR)/main.c
-DATA_LOC ?= 0x72B0
-PCW_DATA_LOC ?= 0x7290
+DATA_LOC ?= 0x7B80
+PCW_DATA_LOC ?= 0x7B80
 APPDEFS ?=
 
 SDCC ?= sdcc
@@ -41,9 +41,17 @@ PCW_DSK := $(DIST)/GB-PAINT-PCW.DSK
 
 PAINT_TOOLS := \
 	assets/paint/pencil.asm \
+	assets/paint/line.asm \
 	assets/paint/square.asm \
+	assets/paint/boxfill.asm \
 	assets/paint/circle.asm \
-	assets/paint/fill.asm \
+	assets/paint/circlefill.asm \
+	assets/paint/bucket.asm \
+	assets/paint/spray.asm \
+	assets/paint/select.asm \
+	assets/paint/cut.asm \
+	assets/paint/copy.asm \
+	assets/paint/paste.asm \
 	assets/paint/undo.asm
 
 SAMPLES := \
@@ -55,14 +63,14 @@ SAMPLES := \
 REL := \
 	$(BUILD)/crt0.rel \
 	$(BUILD)/main.rel \
-	$(BUILD)/gbwin.rel \
+	$(BUILD)/gbsizedlg.rel \
 	$(BUILD)/gbui_stub.rel \
 	$(BUILD)/gblib.rel
 
 PCW_REL := \
 	$(PCW_BUILD)/crt0.rel \
 	$(PCW_BUILD)/main.rel \
-	$(PCW_BUILD)/gbwin.rel \
+	$(PCW_BUILD)/gbsizedlg.rel \
 	$(PCW_BUILD)/gbui_stub.rel \
 	$(PCW_BUILD)/gblib.rel
 
@@ -109,10 +117,10 @@ $(BUILD)/gblib.rel: $(GBLIB_SUBSET) | $(BUILD)
 $(BUILD)/main.rel: $(SRC) $(GB)/gb.h Makefile | $(BUILD)
 	$(SDCC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/gbwin.rel: $(GB)/gbwin.c $(GB)/gb.h Makefile | $(BUILD)
-	$(SDCC) $(CFLAGS) -DGBWIN_DRAG_ONLY -c $< -o $@
-
 $(BUILD)/gbui_stub.rel: $(GB)/gbui_stub.c $(GB)/gb.h Makefile | $(BUILD)
+	$(SDCC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/gbsizedlg.rel: $(GB)/gbsizedlg.c $(GB)/gb.h Makefile | $(BUILD)
 	$(SDCC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/app.ihx: check-sdk $(REL)
@@ -156,10 +164,10 @@ $(PCW_BUILD)/gblib.rel: $(GBLIB_SUBSET) | $(PCW_BUILD)
 $(PCW_BUILD)/main.rel: $(SRC) $(GB)/gb.h Makefile | $(PCW_BUILD)
 	$(SDCC) $(PCW_CFLAGS) -c $< -o $@
 
-$(PCW_BUILD)/gbwin.rel: $(GB)/gbwin.c $(GB)/gb.h Makefile | $(PCW_BUILD)
-	$(SDCC) $(PCW_CFLAGS) -DGBWIN_DRAG_ONLY -c $< -o $@
-
 $(PCW_BUILD)/gbui_stub.rel: $(GB)/gbui_stub.c $(GB)/gb.h Makefile | $(PCW_BUILD)
+	$(SDCC) $(PCW_CFLAGS) -c $< -o $@
+
+$(PCW_BUILD)/gbsizedlg.rel: $(GB)/gbsizedlg.c $(GB)/gb.h Makefile | $(PCW_BUILD)
 	$(SDCC) $(PCW_CFLAGS) -c $< -o $@
 
 $(PCW_BUILD)/app.ihx: check-sdk $(PCW_REL)
