@@ -6,7 +6,7 @@ DIST := dist
 GB := $(GEOBENCH)/lib/gb
 APP_DIR := apps/paint
 SRC := $(APP_DIR)/main.c
-DATA_LOC ?= 0x7B80
+DATA_LOC ?= 0x79E0
 PCW_DATA_LOC ?= 0x7B80
 APPDEFS ?=
 

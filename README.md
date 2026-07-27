@@ -77,9 +77,9 @@ display.
 
 Paint starts with a movable Toolchest window. File > New opens one dimensions
 panel with framed width and height fields defaulting to 100 by 100. File > Load
-opens a scrollable Area Selector with a fixed 10x10 red navigator. Releasing that
-navigator opens a 100x100 Canvas window where each selected source pixel is
-shown at 10x magnification. Edits are written back to the banked source picture
+opens a scrollable Area Selector with a fixed 20x20 red navigator. Releasing that
+navigator opens a 160x160 Canvas window where each selected source pixel is
+shown at 8x magnification. Edits are written back to the banked source picture
 and immediately reflected in the preview.
 
 The editor accepts complete GBPC files up to 16 KiB. CPC and PCW edit portable
