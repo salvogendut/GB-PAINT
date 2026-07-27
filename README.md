@@ -6,7 +6,7 @@ This repository builds `PAINT.APP` against the GEOBENCH app ABI and packages
 companion disk images containing:
 
 - `PAINT.APP`
-- `PAINT.IST` with the five toolchest icons currently used by the app
+- `PAINT.IST` with the thirteen 24x21 toolchest icons used by the app
 - a small portable `.PIC` sample set that fits on a CPC/PCW data disk
 
 The full Paint tool artwork lives under `assets/paint/`, with the source sheet
@@ -73,16 +73,19 @@ GEOBENCH system media.
 
 `PAINT.IST` uses GEOBENCH's portable canonical Mode-1 encoding and is identical
 on CPC, MSX2, and PCW. Paint converts only the tool-icon rows sent to a non-CPC
-display, just as it does for its picture canvas.
+display.
 
-Paint keeps its canvas in GEOBENCH's canonical GBPC v2 Mode-1 packing and saves
-the same byte representation on CPC, MSX2, and PCW. MSX2 and PCW translate only
-the rows sent to their displays, so the sample `.PIC` files are packaged
-byte-for-byte on both standalone disks.
+Paint starts with a movable Toolchest window. File > New opens one dimensions
+panel with framed width and height fields defaulting to 100 by 100. File > Load
+opens a scrollable Area Selector with a fixed 10x10 red navigator. Releasing that
+navigator opens a 100x100 Canvas window where each selected source pixel is
+shown at 10x magnification. Edits are written back to the banked source picture
+and immediately reflected in the preview.
 
-The PCW build edits normal 100x100 pictures. Large banked pictures are opened
-view-only on CPC/MSX; on PCW they are reported as too large because GEOBENCH's
-banked picture edit helper is not resident there.
+The editor accepts complete GBPC files up to 16 KiB. CPC and PCW edit portable
+four-colour Mode-1 pictures. MSX Paint requires GEOBENCH's 16-colour Mode 7,
+supports all sixteen inks, and is the only build that accepts Mode-7 pictures.
+Launching it under MSX Mode 6 shows an explanatory error and closes safely.
 
 The sample payload is intentionally small. Adding every picture from GEOBENCH's
 main assets would exceed a normal CPC data disk.
