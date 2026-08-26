@@ -87,6 +87,13 @@ four-colour Mode-1 pictures. MSX Paint requires GEOBENCH's 16-colour Mode 7,
 supports all sixteen inks, and is the only build that accepts Mode-7 pictures.
 Launching it under MSX Mode 6 shows an explanatory error and closes safely.
 
+New, Load, Save, and Save As run as root-owned 512-byte jobs, advancing once
+per desktop frame so preemptive GEOBENCH builds remain responsive during
+document I/O. Escape or a close request cancels the active job; an incomplete
+output file is removed rather than left as a valid-looking partial picture.
+Paint's three app-owned panes show a live title-bar outline while being dragged;
+dropping a pane repaints only the old/new damage area instead of the full desktop.
+
 The sample payload is intentionally small. Adding every picture from GEOBENCH's
 main assets would exceed a normal CPC data disk.
 
