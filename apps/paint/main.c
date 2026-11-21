@@ -798,17 +798,11 @@ static void draw_swatch(unsigned char index, unsigned char x,
                  (unsigned char)(h + 2), 3);
 }
 
-static void draw_toolchest(void)
+static void draw_palette(void)
 {
     unsigned char i;
     unsigned char py = (unsigned char)(tc_y + TITLE_H +
                                        TOOL_ROWS * TOOL_STEP_Y + 1);
-    ensure_tools();
-    gb_window(tc_x, tc_y, TC_W, TC_H, tool_title());
-    if (ist_ok) for (i = 0; i < N_TOOLS; i++) draw_tool_icon(i);
-    for (i = 0; i < N_TOOLS; i++)
-        gb_frame(tool_x(i), tool_y(i), TOOL_WB, TOOL_H,
-                 (i == current_tool) ? 3 : 2);
 #ifdef GB_MSX2
     for (i = 0; i < 16; i++)
         draw_swatch(i,
@@ -818,6 +812,18 @@ static void draw_toolchest(void)
     for (i = 0; i < 4; i++)
         draw_swatch(i, (unsigned char)(tc_x + 1 + i * 6), py, 6, 9);
 #endif
+}
+
+static void draw_toolchest(void)
+{
+    unsigned char i;
+    ensure_tools();
+    gb_window(tc_x, tc_y, TC_W, TC_H, tool_title());
+    if (ist_ok) for (i = 0; i < N_TOOLS; i++) draw_tool_icon(i);
+    for (i = 0; i < N_TOOLS; i++)
+        gb_frame(tool_x(i), tool_y(i), TOOL_WB, TOOL_H,
+                 (i == current_tool) ? 3 : 2);
+    draw_palette();
 }
 
 /* Compact 16-bit scroll tracks. A fixed five-pixel thumb keeps the mapper small
@@ -1805,7 +1811,7 @@ static void drag_selector(void)
     }
     work_visible = 1;
     front_pane = PANE_WORK;
-    gb_restore_parent();
+    repaint_all();                  /* New canvas covers, but never exposes, other apps. */
 }
 
 static void drag_vscroll(void)
@@ -2072,10 +2078,17 @@ static unsigned int read_chunk(unsigned int off, unsigned int max)
     return got;
 }
 
+static void retire_panes(void)
+{
+    unsigned char exposed = loaded;
+    close_document();
+    if (exposed) gb_restore_parent();
+}
+
 static unsigned char start_load(const char *name)
 {
     if (!begin_job(IO_LOAD)) return 0;
-    close_document();
+    retire_panes();
     copy11(cur_name, name);
     named = 1;
     doc_len = DOC_MAX;
@@ -2092,6 +2105,7 @@ static unsigned char start_new(unsigned int width, unsigned int height)
     unsigned char *header = (unsigned char *)gb_copybuf;
     if (!begin_job(IO_NEW)) return 0;
     close_document();
+    gb_restore_parent();           /* Remove the size prompt (no save-under) and any old panes. */
 #ifdef GB_MSX2
     pic_mode = 7;
     pic_stride = width >> 1;
@@ -2191,8 +2205,7 @@ static void do_new(void)
     pending_width = width;
     pending_height = height;
     action = confirm_discard(AFTER_NEW);
-    if (action == CONFIRM_NOW && start_new(width, height))
-        gb_restore_parent();
+    if (action == CONFIRM_NOW) start_new(width, height);
 }
 
 static void do_load(void)
@@ -2201,7 +2214,7 @@ static void do_load(void)
     unsigned char action = confirm_discard(AFTER_LOAD);
     if (action != CONFIRM_NOW) return;
     if (!gb_pickfile(name, pic_exts)) return;
-    if (start_load(name)) gb_restore_parent();
+    start_load(name);
 }
 
 /* ---- menus and window interaction --------------------------------------- */
@@ -2244,7 +2257,7 @@ static void run_menu(void)
         else if (choice == 2) copy_selection();
         else if (choice == 3) paste_selection();
     }
-    gb_restore_parent();
+    if (io_job == IO_IDLE) gb_restore_parent();
 }
 
 static void move_pane(unsigned char *x, unsigned char *y,
@@ -2460,8 +2473,19 @@ static void choose_pen(unsigned char pen)
         return;
     }
 #endif
+    if (current_pen == pen) return;
+    gb_curhide();
+    /* The selection frame extends one scanline beyond the swatch at each end. */
+    gb_fill(tc_x + 1, tc_y + TITLE_H + TOOL_ROWS * TOOL_STEP_Y, 24,
+#ifdef GB_MSX2
+            19,
+#else
+            11,
+#endif
+            0);
     current_pen = pen;
-    gb_curhide(); draw_toolchest(); gb_curshow();
+    draw_palette();
+    gb_curshow();
 }
 
 static void tool_action(unsigned char index)
@@ -2615,7 +2639,7 @@ static void finish_open(unsigned char fresh)
             front_pane = PANE_WORK;
         }
     }
-    gb_restore_parent();
+    repaint_all();                  /* Old panes were removed before starting this job. */
 }
 
 static void finish_save(void)
