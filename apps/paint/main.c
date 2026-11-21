@@ -30,6 +30,7 @@
 #define PIC_WB_K      (*(volatile unsigned char *)0x130C)
 #define PIC_H_K       (*(volatile unsigned int  *)0x130D)
 #define PIC_OFF_K     (*(volatile unsigned char *)0x130F)
+#define FS_LOAD_OFS   ((volatile unsigned char *)0x144C)
 #define FS_XFLAGS_K   (*(volatile unsigned char *)0x144F)
 #define FS_SAVE_LEN_K (*(volatile unsigned int  *)0x14FD)
 #define UI_MODAL_K    (*(volatile unsigned char *)0x1705)
@@ -88,20 +89,41 @@
 #define IST_MAX 1800
 #define TOOL_BITS_PER ((TOOL_WB * 4 * TOOL_H) / 8)
 #define TOOL_BITS_LEN (N_TOOLS * TOOL_BITS_PER)
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-/* CPC helper code executes in the upper part of gb_copybuf, so persistent
- * artwork cannot live there. Repack the CPC app page and own these bytes. */
-#define PAINT_IO_MAX GB_COPYMAX
-#else
-/* MSX and PCW have no CPC low-helper collision and need their scarce app-page
- * RAM for the 20x20 tile, so retain the bounded reloadable scratch cache. */
+/* Keep packed tool artwork above the bounded file-I/O staging area. The CPC
+ * picture helper uses only the lower 2500 bytes of gb_copybuf; every Paint file
+ * transfer is capped below this cache on all targets. A clobbered marker simply
+ * causes PAINT.IST to be reloaded before the next Toolchest repaint. */
 #define TOOL_CACHE_MARK 0xA7
 #define TOOL_CACHE_OFFSET (GB_COPYMAX - TOOL_BITS_LEN - 2)
 #define TOOL_CACHE ((unsigned char *)gb_copybuf + TOOL_CACHE_OFFSET)
 #define TOOL_BITS (TOOL_CACHE + 1)
-#define PAINT_IO_MAX TOOL_CACHE_OFFSET
-#endif
+#define PAINT_IO_MAX 512
 #define NATIVE_STAGE ((unsigned char *)gb_copybuf + 1024)
+
+#define IO_IDLE 0
+#define IO_LOAD 1
+#define IO_NEW  2
+#define IO_SAVE 3
+
+#define AFTER_NONE      0
+#define AFTER_NEW       1
+#define AFTER_LOAD      2
+#define AFTER_CLOSE_DOC 3
+#define AFTER_CLOSE_APP 4
+
+#define CONFIRM_CANCEL 0
+#define CONFIRM_NOW    1
+#define CONFIRM_WAIT   2
+
+/* The executable icon preamble is no longer needed after entry. Reuse nine of
+ * its payload bytes for transient job state instead of consuming scarce app
+ * data space on dual-icon MSX builds. */
+#define io_job         (*(volatile unsigned char *)0x4010)
+#define io_after       (*(volatile unsigned char *)0x4011)
+#define io_first       (*(volatile unsigned char *)0x4012)
+#define io_off         (*(volatile unsigned int  *)0x4013)
+#define pending_width  (*(volatile unsigned int  *)0x4015)
+#define pending_height (*(volatile unsigned int  *)0x4017)
 
 static unsigned char tc_x, tc_y;
 static unsigned char pv_x, pv_y;
@@ -128,8 +150,10 @@ static unsigned int scroll_y;
 static unsigned int tile_x;
 static unsigned int tile_y;
 static unsigned char tile[TILE_PIXELS];
-/* Undo retains all sixteen MSX pens while using one nibble per source pixel. */
-static unsigned char undo_tile[TILE_PACKED];
+/* Undo retains all sixteen MSX pens while using one nibble per source pixel.
+ * Its 200 bytes reuse the consumed executable-icon payload after app entry;
+ * 0x4030 follows the I/O/drag scratch and ends safely below code at 0x4110. */
+#define undo_tile ((unsigned char *)0x4030)
 static unsigned char undo_valid;
 static unsigned char work_sel_on;
 static unsigned char work_sel_x0, work_sel_y0, work_sel_x1, work_sel_y1;
@@ -140,10 +164,6 @@ static unsigned char stroke_active;
 static unsigned char stroke_x, stroke_y;
 static unsigned char random_state = 0x5D;
 
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-static unsigned char tool_bits[TOOL_BITS_LEN];
-#define TOOL_BITS tool_bits
-#endif
 static unsigned char ist_ok;
 static unsigned char pv_view_x, pv_view_y, pv_view_w, pv_view_h;
 static unsigned char pv_image_x, pv_image_y;
@@ -155,9 +175,10 @@ static void draw_toolchest(void);
 static void draw_preview(void);
 static void draw_work(void);
 static void close_app(void);
-static unsigned char save_document(void);
+static unsigned char save_document(unsigned char after);
 static unsigned char commit_tile(void);
 static unsigned char unpack_mode1(unsigned char value, unsigned char pixel);
+static void do_load(void);
 #if defined(GB_MSX2) || defined(GB_PCW)
 static void refresh_preview_selection(void);
 #endif
@@ -485,10 +506,8 @@ static void load_tools(void)
     unsigned char icon, x, y, value, nibble;
     unsigned char *source = (unsigned char *)gb_copybuf;
     unsigned char *dest = TOOL_BITS;
-#if defined(GB_MSX2) || defined(GB_PCW)
     TOOL_CACHE[0] = 0;
     TOOL_CACHE[TOOL_BITS_LEN + 1] = 0;
-#endif
     gb_set_name("PAINT   IST");
     got = gb_fs_load((char *)source, IST_MAX);
     ist_ok = (unsigned char)(got >= 16 && source[0] == 'G' &&
@@ -515,23 +534,17 @@ static void load_tools(void)
         }
     }
     if (ist_ok) {
-#if defined(GB_MSX2) || defined(GB_PCW)
         TOOL_CACHE[0] = TOOL_CACHE_MARK;
         TOOL_CACHE[TOOL_BITS_LEN + 1] = (unsigned char)~TOOL_CACHE_MARK;
-#endif
     }
     if (named) gb_set_name(cur_name);
 }
 
 static void ensure_tools(void)
 {
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-    if (!ist_ok) load_tools();
-#else
     if (TOOL_CACHE[0] != TOOL_CACHE_MARK ||
         TOOL_CACHE[TOOL_BITS_LEN + 1] != (unsigned char)~TOOL_CACHE_MARK)
         load_tools();
-#endif
 }
 
 #if !defined(GB_MSX2) && !defined(GB_PCW)
@@ -785,17 +798,11 @@ static void draw_swatch(unsigned char index, unsigned char x,
                  (unsigned char)(h + 2), 3);
 }
 
-static void draw_toolchest(void)
+static void draw_palette(void)
 {
     unsigned char i;
     unsigned char py = (unsigned char)(tc_y + TITLE_H +
                                        TOOL_ROWS * TOOL_STEP_Y + 1);
-    ensure_tools();
-    gb_window(tc_x, tc_y, TC_W, TC_H, tool_title());
-    if (ist_ok) for (i = 0; i < N_TOOLS; i++) draw_tool_icon(i);
-    for (i = 0; i < N_TOOLS; i++)
-        gb_frame(tool_x(i), tool_y(i), TOOL_WB, TOOL_H,
-                 (i == current_tool) ? 3 : 2);
 #ifdef GB_MSX2
     for (i = 0; i < 16; i++)
         draw_swatch(i,
@@ -805,6 +812,18 @@ static void draw_toolchest(void)
     for (i = 0; i < 4; i++)
         draw_swatch(i, (unsigned char)(tc_x + 1 + i * 6), py, 6, 9);
 #endif
+}
+
+static void draw_toolchest(void)
+{
+    unsigned char i;
+    ensure_tools();
+    gb_window(tc_x, tc_y, TC_W, TC_H, tool_title());
+    if (ist_ok) for (i = 0; i < N_TOOLS; i++) draw_tool_icon(i);
+    for (i = 0; i < N_TOOLS; i++)
+        gb_frame(tool_x(i), tool_y(i), TOOL_WB, TOOL_H,
+                 (i == current_tool) ? 3 : 2);
+    draw_palette();
 }
 
 /* Compact 16-bit scroll tracks. A fixed five-pixel thumb keeps the mapper small
@@ -1792,7 +1811,7 @@ static void drag_selector(void)
     }
     work_visible = 1;
     front_pane = PANE_WORK;
-    gb_restore_parent();
+    repaint_all();                  /* New canvas covers, but never exposes, other apps. */
 }
 
 static void drag_vscroll(void)
@@ -1838,112 +1857,255 @@ static void drag_hscroll(void)
 static const char *const pic_exts[] = { "PIC", 0 };
 static char prompt_name[16];
 
-static unsigned char inspect_header(const unsigned char *header)
+static unsigned char parse_header(const unsigned char *header,
+                                  unsigned int got) __naked
 {
-    if (header[0] != 'G' || header[1] != 'B' ||
-        header[2] != 'P' || header[3] != 'C') return 0;
-    if (header[4] == 2) {
-        if (header[5] != 1 && header[5] != 6 && header[5] != 7)
-            return 0;
+    (void)header; (void)got;
+__asm
+    ; HL=header, DE=bytes read. Preserve no caller registers; return A.
+    ld   a,d
+    or   a
+    jr   nz,ph_got6
+    ld   a,e
+    cp   #6
+    jp   c,ph_bad
+ph_got6:
+    ld   a,(hl)
+    cp   #'G'
+    jp   nz,ph_bad
+    inc  hl
+    ld   a,(hl)
+    cp   #'B'
+    jp   nz,ph_bad
+    inc  hl
+    ld   a,(hl)
+    cp   #'P'
+    jp   nz,ph_bad
+    inc  hl
+    ld   a,(hl)
+    cp   #'C'
+    jp   nz,ph_bad
+    inc  hl                         ; header byte 4
+    ld   a,(hl)
+    cp   #2
+    jr   nz,ph_v1
+
+    ld   a,d
+    or   a
+    jr   nz,ph_v2_size
+    ld   a,e
+    cp   #14
+    jp   c,ph_bad
+ph_v2_size:
+    inc  hl                         ; mode
+    ld   a,(hl)
+    cp   #1
+    jr   z,ph_v2_mode
+    cp   #7
+    jp   nz,ph_bad
+__endasm;
 #ifndef GB_MSX2
-        if (header[5] == 7) return 2;
+__asm
+    xor  a
+    ret
+__endasm;
 #endif
-    } else if (!header[4] || !header[5]) return 0;
+__asm
+ph_v2_mode:
+    ld   (_pic_mode),a
+    inc  hl                         ; width low
+    ld   c,(hl)
+    inc  hl
+    ld   b,(hl)
+    inc  hl                         ; height low
+    ld   a,b
+    or   c
+    jp   z,ph_bad
+    ld   a,b                        ; width <= 512
+    cp   #2
+    jr   c,ph_width_ok
+    jp   nz,ph_bad
+    ld   a,c
+    or   a
+    jp   nz,ph_bad
+ph_width_ok:
+    ld   (_pic_width),bc
+    push hl
+    ld   h,b
+    ld   l,c
+    inc  hl
+    inc  hl
+    inc  hl
+    srl  h
+    rr   l
+    srl  h
+    rr   l
+    ld   a,l
+    ld   (_pic_wb),a
+    ld   a,(_pic_mode)
+    cp   #7
+    jr   nz,ph_stride_wb
+    ld   h,b
+    ld   l,c
+    inc  hl
+    srl  h
+    rr   l
+    jr   ph_stride_ready
+ph_stride_wb:
+    ld   a,(_pic_wb)
+    ld   l,a
+    ld   h,#0
+ph_stride_ready:
+    ld   (_pic_stride),hl
+    pop  hl                         ; height low
+    ld   e,(hl)
+    inc  hl
+    ld   d,(hl)
+    ld   a,d
+    or   e
+    jp   z,ph_bad
+    ld   (_pic_height),de
+    ld   a,#14
+    jr   ph_geometry
+
+ph_v1:
+    or   a
+    jp   z,ph_bad
+    ld   (_pic_wb),a
+    ld   l,a
+    ld   h,#0
+    ld   (_pic_stride),hl
+    add  hl,hl
+    add  hl,hl
+    ld   (_pic_width),hl
+    ld   a,#1
+    ld   (_pic_mode),a
+    ; The original header pointer is gb_copybuf for every bounded load.
+    ld   hl,#0x2205
+    ld   e,(hl)
+    ld   d,#0
+    ld   a,e
+    or   a
+    jp   z,ph_bad
+    ld   (_pic_height),de
+    ld   a,#6
+
+ph_geometry:
+    ld   (_pic_off),a
+    ld   c,a
+    ld   b,#0
+    push bc                         ; preserve bitmap offset
+    ld   hl,#0x4000
+    or   a
+    sbc  hl,bc
+    ld   de,(_pic_stride)
+    call __divuint                  ; DE = maximum legal height
+    ld   hl,(_pic_height)
+    or   a
+    sbc  hl,de
+    jr   c,ph_fits
+    jr   z,ph_fits
+    pop  bc
+    xor  a
+    ret
+ph_fits:
+    ld   hl,(_pic_stride)
+    ld   de,(_pic_height)
+    call __mulint                   ; DE = bitmap byte length
+    pop  bc
+    ex   de,hl
+    add  hl,bc
+    ld   (_doc_len),hl
+    ld   a,#1
+    ret
+ph_bad:
+    xor  a
+    ret
+__endasm;
+}
+
+static unsigned char begin_job(unsigned char job)
+{
+    if (gb_drop_claimed()) {
+        gb_alert("Storage busy", "Try again shortly");
+        return 0;
+    }
+    gb_drop_claim();
+    io_job = job;
+    io_after = AFTER_NONE;
+    io_first = 1;
+    io_off = 0;
     return 1;
 }
 
-static unsigned char open_named_picture(const char *name)
+static void stop_job(unsigned char discard_output)
 {
-    unsigned int source_width;
-    unsigned char page2;
-    unsigned char *header = (unsigned char *)gb_copybuf;
-#ifdef GB_MSX2
-    unsigned char page3, page4;
-#endif
-    gb_set_name(name);
-    doc_page = gb_pic_open();
-    UI_MODAL_K = 0;
-    if (!doc_page) {
-#ifndef GB_MSX2
-        gb_alert("Picture not loaded", "Four-color GBPC required");
-#else
-        gb_alert("Picture not loaded", "Invalid or no free bank");
-#endif
-        if (named) gb_set_name(cur_name);
-        return 0;
+    unsigned char job = io_job;
+    io_job = IO_IDLE;
+    FS_XFLAGS_K = 0;
+    if (job == IO_SAVE && discard_output && !io_first) {
+        gb_set_name(cur_name);
+        gb_file_delete(cur_name);
+        UI_MODAL_K = 0;
     }
-    page2 = PIC_PAGE2_K;
-#ifdef GB_MSX2
-    page3 = PIC_PAGE3_K;
-    page4 = PIC_PAGE4_K;
-#endif
-    doc_len = PIC_SIZE_K;
-    if (page2 || doc_len > DOC_MAX
-#ifdef GB_MSX2
-        || page3 || page4
-#endif
-        ) {
-        PIC_PAGE_K = doc_page;
-        PIC_PAGE2_K = page2;
-#ifdef GB_MSX2
-        PIC_PAGE3_K = page3;
-        PIC_PAGE4_K = page4;
-#endif
-        gb_pic_close();
-        doc_page = 0;
-        gb_alert("Picture too large", "16K maximum");
-        if (named) gb_set_name(cur_name);
-        return 0;
-    }
-    pic_wb = PIC_WB_K;
-    pic_height = PIC_H_K;
-    pic_off = PIC_OFF_K;
-#ifdef GB_MSX2
-    pic_mode = PIC_MODE_K;
-    pic_stride = PIC_STRIDE_K;
-#else
-    pic_mode = 1;
-    pic_stride = pic_wb;
-#endif
-    select_document();
-    if (!document_read(0, header, PIC_HDR) ||
-        inspect_header(header) != 1) {
-        release_document_page();
-        gb_alert("Invalid picture", "GBPC header required");
-        if (named) gb_set_name(cur_name);
-        return 0;
-    }
-    source_width = header[4] == 2 ?
-        ((unsigned int)header[6] | ((unsigned int)header[7] << 8)) : 0;
-    pic_width = source_width ? source_width : (unsigned int)pic_wb * 4U;
-    if (!pic_width || !pic_height || !pic_stride || doc_len < pic_off ||
-        pic_height > (unsigned int)((doc_len - pic_off) / pic_stride)) {
-        release_document_page();
-        gb_alert("Incomplete picture", "Bitmap data missing");
-        if (named) gb_set_name(cur_name);
-        return 0;
-    }
-    copy11(cur_name, name);
+    gb_drop_release();
+    if (job == IO_LOAD || job == IO_NEW) close_document();
+}
+
+static void job_error(const char *title, const char *message)
+{
+    stop_job(1);
+    gb_alert(title, message);
+    gb_restore_parent();
+}
+
+static void io_error(void)
+{
+    job_error("Paint I/O failed", "Check file or disk");
+}
+
+static unsigned int read_chunk(unsigned int off, unsigned int max)
+{
+    unsigned int got;
     gb_set_name(cur_name);
+    FS_LOAD_OFS[0] = (unsigned char)off;
+    FS_LOAD_OFS[1] = (unsigned char)(off >> 8);
+    FS_LOAD_OFS[2] = 0;
+    FS_XFLAGS_K = 1;
+    got = gb_fs_load(gb_copybuf, max);
+    FS_XFLAGS_K = 0;
+    UI_MODAL_K = 0;
+    return got;
+}
+
+static void retire_panes(void)
+{
+    unsigned char exposed = loaded;
+    close_document();
+    if (exposed) gb_restore_parent();
+}
+
+static unsigned char start_load(const char *name)
+{
+    if (!begin_job(IO_LOAD)) return 0;
+    retire_panes();
+    copy11(cur_name, name);
     named = 1;
-    loaded = 1;
-    dirty = 0;
-    scroll_x = scroll_y = 0;
-    tile_x = tile_y = 0;
-    work_visible = 0;
-    work_sel_on = 0;
-    undo_valid = 0;
-    front_pane = PANE_PREVIEW;
-    select_document();
+    doc_len = DOC_MAX;
+    if (!allocate_document_page()) {
+        stop_job(0);
+        gb_alert("Picture not loaded", "No free picture bank");
+        return 0;
+    }
     return 1;
 }
 
-static unsigned char create_picture(unsigned int width, unsigned int height)
+static unsigned char start_new(unsigned int width, unsigned int height)
 {
-    unsigned int remaining, off, take, i;
-    unsigned char blank;
     unsigned char *header = (unsigned char *)gb_copybuf;
-
+    if (!begin_job(IO_NEW)) return 0;
+    close_document();
+    gb_restore_parent();           /* Remove the size prompt (no save-under) and any old panes. */
 #ifdef GB_MSX2
     pic_mode = 7;
     pic_stride = width >> 1;
@@ -1957,6 +2119,7 @@ static unsigned char create_picture(unsigned int width, unsigned int height)
     pic_off = PIC_HDR;
     doc_len = PIC_HDR + pic_stride * height;
     if (!allocate_document_page()) {
+        stop_job(0);
         gb_alert("New picture failed", "No free picture bank");
         return 0;
     }
@@ -1968,75 +2131,21 @@ static unsigned char create_picture(unsigned int width, unsigned int height)
     header[9] = (unsigned char)(height >> 8);
     header[10] = 1; header[11] = 26; header[12] = 0; header[13] = 6;
     if (!document_write(0, header, PIC_HDR)) {
-        release_document_page();
-        gb_alert("New picture failed", "Header write error");
+        io_error();
         return 0;
     }
-    blank = pic_mode == 7 ? 0x11 : 0xF0;
-    /* MSX/PCW reserve the upper scratch bytes for reloadable tool artwork;
-       CPC owns its artwork in the app page and therefore uses the full buffer. */
-    for (i = 0; i < PAINT_IO_MAX; i++)
-        ((unsigned char *)gb_copybuf)[i] = blank;
-    remaining = doc_len - PIC_HDR;
-    off = PIC_HDR;
-    while (remaining) {
-        take = remaining > PAINT_IO_MAX ? PAINT_IO_MAX : remaining;
-        if (!document_write(off, gb_copybuf, take)) {
-            release_document_page();
-            gb_alert("New picture failed", "Bitmap write error");
-            return 0;
-        }
-        off += take;
-        remaining -= take;
-    }
-    loaded = 1;
-    named = 0;
-    dirty = 1;
-    clear_name();
-    scroll_x = scroll_y = 0;
-    tile_x = tile_y = 0;
-    work_visible = 0;
-    work_sel_on = 0;
-    undo_valid = 0;
-    select_document();
-    if (!load_tile()) {
-        release_document_page();
-        reset_editor_state();
-        gb_alert("New picture failed", "Could not read canvas");
-        return 0;
-    }
-    work_visible = 1;
-    front_pane = PANE_WORK;
+    io_off = PIC_HDR;
     return 1;
 }
 
-static unsigned char save_to_current_name(void)
+static unsigned char start_save(unsigned char after)
 {
-    unsigned int off = 0, take;
-    unsigned char first = 1;
-    if (!loaded || !named) return 0;
-    gb_set_name(cur_name);
-    while (off < doc_len) {
-        take = doc_len - off;
-        if (take > PAINT_IO_MAX) take = PAINT_IO_MAX;
-        if (!document_read(off, gb_copybuf, take)) break;
-        FS_XFLAGS_K = first ? 0x04 : 0x06;
-        if (!gb_fs_save(gb_copybuf, take)) break;
-        first = 0;
-        off += take;
-    }
-    FS_XFLAGS_K = 0;
-    UI_MODAL_K = 0;
-    if (off != doc_len) {
-        gb_alert("Save failed", "Check destination");
-        return 0;
-    }
-    dirty = 0;
-    undo_valid = 0;
+    if (!loaded || !named || !begin_job(IO_SAVE)) return 0;
+    io_after = after;
     return 1;
 }
 
-static unsigned char save_as(void)
+static unsigned char save_as(unsigned char after)
 {
     char raw[11];
     if (!loaded) return 0;
@@ -2046,33 +2155,35 @@ static unsigned char save_as(void)
     copy11(cur_name, raw);
     named = 1;
     gb_set_name(cur_name);
-    return save_to_current_name();
+    return start_save(after);
 }
 
-static unsigned char save_document(void)
+static unsigned char save_document(unsigned char after)
 {
     if (!loaded) return 0;
-    if (!named) return save_as();
-    return save_to_current_name();
+    if (!named) return save_as(after);
+    return start_save(after);
 }
 
 static const char *const confirm_items[] = {
     "Save", "Don't Save", "Cancel"
 };
 
-static unsigned char confirm_discard(void)
+static unsigned char confirm_discard(unsigned char after)
 {
     unsigned char choice;
-    if (!dirty) return 1;
+    if (!dirty) return CONFIRM_NOW;
     choice = gb_popup(28, 80, confirm_items, 3);
-    if (choice == 0) return save_document();
-    if (choice == 1) return 1;
-    return 0;
+    if (choice == 0)
+        return save_document(after) ? CONFIRM_WAIT : CONFIRM_CANCEL;
+    if (choice == 1) return CONFIRM_NOW;
+    return CONFIRM_CANCEL;
 }
 
 static void do_new(void)
 {
     unsigned int width = 100, height = 100, stride;
+    unsigned char action;
     if (!gb_size_prompt(&width, &height)) return;
     if (!width || width > 512 || !height) {
         gb_alert("Invalid dimensions", "Width 1..512");
@@ -2091,18 +2202,19 @@ static void do_new(void)
         gb_alert("Picture too large", "16K maximum");
         return;
     }
-    if (!confirm_discard()) return;
-    close_document();
-    if (create_picture(width, height)) gb_restore_parent();
+    pending_width = width;
+    pending_height = height;
+    action = confirm_discard(AFTER_NEW);
+    if (action == CONFIRM_NOW) start_new(width, height);
 }
 
 static void do_load(void)
 {
     char name[11];
-    if (!confirm_discard()) return;
+    unsigned char action = confirm_discard(AFTER_LOAD);
+    if (action != CONFIRM_NOW) return;
     if (!gb_pickfile(name, pic_exts)) return;
-    close_document();
-    if (open_named_picture(name)) gb_restore_parent();
+    start_load(name);
 }
 
 /* ---- menus and window interaction --------------------------------------- */
@@ -2135,8 +2247,8 @@ static void run_menu(void)
         choice = gb_popup(MENU_FILE_X, 8, file_items, 5);
         if (choice == 0) do_new();
         else if (choice == 1) do_load();
-        else if (choice == 2) save_document();
-        else if (choice == 3) save_as();
+        else if (choice == 2) save_document(AFTER_NONE);
+        else if (choice == 3) save_as(AFTER_NONE);
         else if (choice == 4) { close_app(); return; }
     } else if (menu == 2) {
         choice = gb_popup(MENU_EDIT_X, 8, edit_items, 4);
@@ -2145,34 +2257,212 @@ static void run_menu(void)
         else if (choice == 2) copy_selection();
         else if (choice == 3) paste_selection();
     }
-    gb_restore_parent();
+    if (io_job == IO_IDLE) gb_restore_parent();
 }
 
 static void move_pane(unsigned char *x, unsigned char *y,
-                      unsigned char w, unsigned char h)
+                      unsigned char w, unsigned char h) __naked
 {
-    unsigned char ox = *x, oy = *y;
-    unsigned char grab_x = (unsigned char)(gb_mx() - ox);
-    unsigned char grab_y = (unsigned char)(gb_my() - oy);
-    unsigned char nx, ny, mx, my, flags;
+    (void)x; (void)y; (void)w; (void)h;
+__asm
+    ; Transient state lives in the consumed executable-icon payload. The app
+    ; data area is full on dual-icon MSX builds, and these bytes are dead after
+    ; entry just like the bounded-I/O state at 0x4010.
+    ld   (0x4019),hl                  ; x pointer
+    ld   (0x401b),de                  ; y pointer
+    ld   a,(hl)
+    ld   (0x401d),a                   ; original/last x
+    ld   (0x401f),a
+    ld   a,(de)
+    ld   (0x401e),a                   ; original/last y
+    ld   (0x4020),a
+    ld   hl,#2
+    add  hl,sp
+    ld   a,(hl)
+    ld   (0x4023),a                   ; pane width
+    inc  hl
+    ld   a,(hl)
+    ld   (0x4024),a                   ; pane height
+    call _gb_mx
+    ld   b,a
+    ld   a,(0x401d)
+    ld   c,a
+    ld   a,b
+    sub  c
+    ld   (0x4025),a                   ; pointer grab x
+    call _gb_my
+    ld   b,a
+    ld   a,(0x401e)
+    ld   c,a
+    ld   a,b
+    sub  c
+    ld   (0x4026),a                   ; pointer grab y
+    xor  a
+    ld   (0x4027),a                   ; moved
 
-    do {
-        flags = gb_poll();
-    } while (flags & GB_FIRE);
-    mx = gb_mx();
-    my = gb_my();
-    nx = mx >= grab_x ? (unsigned char)(mx - grab_x) : 0;
-    ny = my >= grab_y ? (unsigned char)(my - grab_y) : 8;
-    if (nx > (unsigned char)(GB_COLS - w))
-        nx = (unsigned char)(GB_COLS - w);
-    if (ny < 8) ny = 8;
-    if (ny > (unsigned char)(GB_LINES - h))
-        ny = (unsigned char)(GB_LINES - h);
-    if (nx != ox || ny != oy) {
-        *x = nx;
-        *y = ny;
-        gb_restore_parent();
-    }
+mp_loop:
+    call _gb_poll
+    ld   (0x4028),a                   ; flags
+
+    call _gb_mx
+    ld   c,a
+    ld   a,(0x4025)
+    ld   b,a
+    ld   a,c
+    sub  b
+    jr   nc,mp_x_nonneg
+    xor  a
+mp_x_nonneg:
+    ld   b,a                          ; candidate x
+    ld   a,#GB_COLS
+    ld   c,a
+    ld   a,(0x4023)
+    ld   e,a
+    ld   a,c
+    sub  e                            ; maximum x
+    cp   b
+    jr   nc,mp_x_ok
+    ld   b,a
+mp_x_ok:
+    ld   a,b
+    ld   (0x4021),a                   ; next x
+
+    call _gb_my
+    ld   c,a
+    ld   a,(0x4026)
+    ld   b,a
+    ld   a,c
+    sub  b
+    jr   nc,mp_y_nonneg
+    ld   a,#8
+mp_y_nonneg:
+    cp   #8
+    jr   nc,mp_y_top
+    ld   a,#8
+mp_y_top:
+    ld   b,a                          ; candidate y
+    ld   a,#GB_LINES
+    ld   c,a
+    ld   a,(0x4024)
+    ld   e,a
+    ld   a,c
+    sub  e                            ; maximum y
+    cp   b
+    jr   nc,mp_y_ok
+    ld   b,a
+mp_y_ok:
+    ld   a,b
+    ld   (0x4022),a                   ; next y
+
+    ld   a,(0x401f)
+    ld   b,a
+    ld   a,(0x4021)
+    cp   b
+    jr   nz,mp_changed
+    ld   a,(0x4020)
+    ld   b,a
+    ld   a,(0x4022)
+    cp   b
+    jr   z,mp_next
+mp_changed:
+    ld   a,(0x4027)
+    or   a
+    jr   z,mp_draw
+    ld   a,(0x401f)
+    ld   (0x4029),a
+    ld   a,(0x4020)
+    ld   (0x402a),a
+    ld   a,(0x4021)
+    ld   (0x402b),a
+    ld   a,(0x4022)
+    ld   (0x402c),a
+    ld   a,#TITLE_H
+    ld   (0x402d),a
+    call mp_damage
+    call _gb_restore_parent
+
+mp_draw:
+    call _gb_curhide
+    ld   a,(0x4021)
+    ld   b,a
+    ld   a,(0x4022)
+    ld   c,a
+    ld   a,(0x4023)
+    ld   d,a
+    ld   e,#TITLE_H
+    ld   a,#3
+    call 0x8021                       ; GB_FRAME
+    call _gb_curshow
+    ld   a,(0x4021)
+    ld   (0x401f),a
+    ld   a,(0x4022)
+    ld   (0x4020),a
+    ld   a,#1
+    ld   (0x4027),a
+
+mp_next:
+    ld   a,(0x4028)
+    and  #GB_FIRE
+    jp   nz,mp_loop
+    ld   a,(0x4027)
+    or   a
+    jr   z,mp_return
+
+    ld   hl,(0x4019)
+    ld   a,(0x401f)
+    ld   (hl),a
+    ld   hl,(0x401b)
+    ld   a,(0x4020)
+    ld   (hl),a
+    ld   a,(0x401d)
+    ld   (0x4029),a
+    ld   a,(0x401e)
+    ld   (0x402a),a
+    ld   a,(0x401f)
+    ld   (0x402b),a
+    ld   a,(0x4020)
+    ld   (0x402c),a
+    ld   a,(0x4024)
+    ld   (0x402d),a
+    call mp_damage
+    call _gb_restore_parent
+
+mp_return:
+    pop  hl                           ; discard packed w/h after return address
+    pop  af
+    jp   (hl)
+
+    ; Damage = bounding rectangle of (ax,ay) and (bx,by), using the pane width
+    ; and caller-selected height. k_wm_damage leaves the next compositor repaint
+    ; clipped to this rectangle.
+mp_damage:
+    ld   a,(0x4029)                   ; ax
+    ld   c,a
+    ld   a,(0x402b)                   ; bx
+    cp   c
+    jr   nc,mp_dx_ordered
+    ld   c,a                          ; left=bx, right starts at ax
+    ld   a,(0x4029)
+mp_dx_ordered:
+    ld   hl,#0x4023                   ; pane width
+    add  a,(hl)
+    sub  c
+    ld   e,a
+    ld   a,(0x402a)                   ; ay
+    ld   b,a
+    ld   a,(0x402c)                   ; by
+    cp   b
+    jr   nc,mp_dy_ordered
+    ld   b,a                          ; top=by, bottom starts at ay
+    ld   a,(0x402a)
+mp_dy_ordered:
+    ld   hl,#0x402d                   ; damage height
+    add  a,(hl)
+    sub  b
+    ld   d,a
+    call 0x80b4                       ; GB_WMDAMAGE: C=x B=y E=w D=h
+    ret
+__endasm;
 }
 
 static void choose_pen(unsigned char pen)
@@ -2183,8 +2473,19 @@ static void choose_pen(unsigned char pen)
         return;
     }
 #endif
+    if (current_pen == pen) return;
+    gb_curhide();
+    /* The selection frame extends one scanline beyond the swatch at each end. */
+    gb_fill(tc_x + 1, tc_y + TITLE_H + TOOL_ROWS * TOOL_STEP_Y, 24,
+#ifdef GB_MSX2
+            19,
+#else
+            11,
+#endif
+            0);
     current_pen = pen;
-    gb_curhide(); draw_toolchest(); gb_curshow();
+    draw_palette();
+    gb_curshow();
 }
 
 static void tool_action(unsigned char index)
@@ -2238,7 +2539,8 @@ static void preview_click(unsigned char mx, unsigned char my)
     front_pane = PANE_PREVIEW;
     if (title_hit(pv_x, pv_y, PV_W, mx, my)) {
         if (close_hit(pv_x, pv_y, mx, my)) {
-            if (confirm_discard()) {
+            unsigned char action = confirm_discard(AFTER_CLOSE_DOC);
+            if (action == CONFIRM_NOW) {
                 close_document();
                 gb_restore_parent();
             }
@@ -2298,18 +2600,142 @@ static void handle_click(void)
 
 static void close_app(void)
 {
-    if (!confirm_discard()) {
+    unsigned char action = confirm_discard(AFTER_CLOSE_APP);
+    if (action == CONFIRM_CANCEL) {
         gb_restore_parent();
         return;
     }
+    if (action == CONFIRM_WAIT) return;
     release_document_page();
     FS_XFLAGS_K = 0;
     gb_wm_close();
 }
 
+static void finish_open(unsigned char fresh)
+{
+    if (!fresh && io_off < doc_len) {
+        io_error();
+        return;
+    }
+    if (!fresh) doc_len = io_off;
+    io_job = IO_IDLE;
+    gb_drop_release();
+    loaded = 1;
+    dirty = fresh;
+    if (fresh) {
+        named = 0;
+        clear_name();
+    }
+    scroll_x = scroll_y = tile_x = tile_y = 0;
+    work_visible = work_sel_on = undo_valid = 0;
+    front_pane = PANE_PREVIEW;
+    select_document();
+    if (fresh) {
+        if (!load_tile()) {
+            close_document();
+            gb_alert("New picture failed", "Could not read canvas");
+        } else {
+            work_visible = 1;
+            front_pane = PANE_WORK;
+        }
+    }
+    repaint_all();                  /* Old panes were removed before starting this job. */
+}
+
+static void finish_save(void)
+{
+    unsigned char after = io_after;
+    io_job = IO_IDLE;
+    io_after = AFTER_NONE;
+    FS_XFLAGS_K = 0;
+    gb_drop_release();
+    dirty = 0;
+    undo_valid = 0;
+    if (after == AFTER_NEW) start_new(pending_width, pending_height);
+    else if (after == AFTER_LOAD) do_load();
+    else if (after == AFTER_CLOSE_DOC) {
+        close_document();
+        gb_restore_parent();
+    } else if (after == AFTER_CLOSE_APP) {
+        release_document_page();
+        gb_wm_close();
+    } else gb_restore_parent();
+}
+
+static void step_job(void)
+{
+    unsigned int take, got, i;
+    unsigned char blank;
+    if (io_job == IO_LOAD) {
+        if (io_off == DOC_MAX) {
+            if (read_chunk(io_off, 1))
+                io_error();
+            else finish_open(0);
+            return;
+        }
+        take = DOC_MAX - io_off;
+        if (take > PAINT_IO_MAX) take = PAINT_IO_MAX;
+        got = read_chunk(io_off, take);
+        if (io_first) {
+            if (!parse_header((unsigned char *)gb_copybuf, got)) {
+                io_error();
+                return;
+            }
+            io_first = 0;
+        }
+        if (got && !document_write(io_off, gb_copybuf, got)) {
+            io_error();
+            return;
+        }
+        io_off += got;
+        if (got < take) finish_open(0);
+        return;
+    }
+    if (io_job == IO_NEW) {
+        take = doc_len - io_off;
+        if (take > PAINT_IO_MAX) take = PAINT_IO_MAX;
+        blank = pic_mode == 7 ? 0x11 : 0xF0;
+        for (i = 0; i < take; i++)
+            ((unsigned char *)gb_copybuf)[i] = blank;
+        if (!document_write(io_off, gb_copybuf, take)) {
+            io_error();
+            return;
+        }
+        io_off += take;
+        if (io_off == doc_len) finish_open(1);
+        return;
+    }
+    take = doc_len - io_off;
+    if (take > PAINT_IO_MAX) take = PAINT_IO_MAX;
+    if (!document_read(io_off, gb_copybuf, take)) {
+        io_error();
+        return;
+    }
+    gb_set_name(cur_name);
+    FS_XFLAGS_K = io_first ? 0x04 : 0x06;
+    if (!gb_fs_save(gb_copybuf, take)) {
+        io_first = 0;
+        io_error();
+        return;
+    }
+    io_first = 0;
+    FS_XFLAGS_K = 0;
+    UI_MODAL_K = 0;
+    io_off += take;
+    if (io_off == doc_len) finish_save();
+}
+
 static void paint_frame(void)
 {
     unsigned char flags;
+    if (io_job != IO_IDLE) {
+        flags = gb_flags();
+        if ((flags & GB_QUIT) || gb_getkey() == 27) {
+            stop_job(1);
+            gb_restore_parent();
+        } else step_job();
+        return;
+    }
     if (want_menu) {
         run_menu();
         return;
@@ -2363,6 +2789,7 @@ static void initial_layout(void)
 void main(void)
 {
     unsigned char i;
+    io_job = IO_IDLE;
     gb_wm_add(&paint_window);
 #ifdef GB_MSX2
     if (MSX_SCRMOD != 7) {
@@ -2381,7 +2808,7 @@ void main(void)
 #if !defined(GB_MSX2) && !defined(GB_PCW)
     load_picedit_helper();
 #endif
-    if (is_pic_name(launch_name)) open_named_picture(launch_name);
+    if (is_pic_name(launch_name)) start_load(launch_name);
     for (i = 64; i; i--) if (!gb_getkey()) break;
     gb_restore_parent();
 }

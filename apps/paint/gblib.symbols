@@ -13,6 +13,7 @@ gb_my
 gb_flags
 gb_fs_load
 gb_fs_save
+gb_file_delete
 gb_getkey
 gb_clip_set
 gb_clip_get
