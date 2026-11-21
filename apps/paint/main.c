@@ -16,6 +16,7 @@
  * running under Screen 7.
  */
 #include "gb.h"
+#include <string.h>
 
 #define TITLE_H 14
 #define PIC_HDR 14
@@ -149,6 +150,7 @@ static unsigned int scroll_x;
 static unsigned int scroll_y;
 static unsigned int tile_x;
 static unsigned int tile_y;
+static unsigned char tile_w, tile_h;
 static unsigned char tile[TILE_PIXELS];
 /* Undo retains all sixteen MSX pens while using one nibble per source pixel.
  * Its 200 bytes reuse the consumed executable-icon payload after app entry;
@@ -167,6 +169,8 @@ static unsigned char random_state = 0x5D;
 static unsigned char ist_ok;
 static unsigned char pv_view_x, pv_view_y, pv_view_w, pv_view_h;
 static unsigned char pv_image_x, pv_image_y;
+static unsigned int sel_px;
+static unsigned char sel_py;
 static unsigned char pv_hbar_x, pv_hbar_y, pv_hbar_w;
 static unsigned char want_menu;
 
@@ -179,9 +183,7 @@ static unsigned char save_document(unsigned char after);
 static unsigned char commit_tile(void);
 static unsigned char unpack_mode1(unsigned char value, unsigned char pixel);
 static void do_load(void);
-#if defined(GB_MSX2) || defined(GB_PCW)
-static void refresh_preview_selection(void);
-#endif
+
 
 /* ---- exact-pixel line primitive ------------------------------------------ */
 
@@ -674,7 +676,7 @@ static unsigned char replace_mode1(unsigned char value, unsigned char pixel,
 
 static unsigned char transfer_tile(unsigned char write)
 {
-    unsigned char row, col, first, last, count, span, position;
+    unsigned char row, col, first, last, span, position;
     unsigned int remain, i;
     unsigned char *buf = (unsigned char *)gb_copybuf;
     unsigned char *pixel;
@@ -684,14 +686,16 @@ static unsigned char transfer_tile(unsigned char write)
     if (!loaded) return 0;
     if (tile_x >= pic_width || tile_y >= pic_height) return 0;
     remain = pic_width - tile_x;
-    count = (unsigned char)(remain > TILE_SIDE ? TILE_SIDE : remain);
+    tile_w = (unsigned char)(remain > TILE_SIDE ? TILE_SIDE : remain);
+    remain = pic_height - tile_y;
+    tile_h = (unsigned char)(remain > TILE_SIDE ? TILE_SIDE : remain);
     if (pic_mode == 7) {
         first = (unsigned char)(tile_x >> 1);
-        last = (unsigned char)((tile_x + count - 1) >> 1);
+        last = (unsigned char)((tile_x + tile_w - 1) >> 1);
         position = (unsigned char)tile_x & 1;
     } else {
         first = (unsigned char)(tile_x >> 2);
-        last = (unsigned char)((tile_x + count - 1) >> 2);
+        last = (unsigned char)((tile_x + tile_w - 1) >> 2);
         position = (unsigned char)tile_x & 3;
     }
     span = (unsigned char)(last - first + 1);
@@ -701,11 +705,11 @@ static unsigned char transfer_tile(unsigned char write)
     fx0 = fx1 * pic_stride;
     fx0 += pic_off;
     fx0 += first;
-    for (row = 0; row < TILE_SIDE && fx1 < pic_height; row++) {
+    for (row = 0; row < tile_h; row++) {
         if (!document_read(fx0, buf, span))
             return 0;
         pixel = &tile[(unsigned int)row * TILE_SIDE];
-        for (col = 0; col < count; col++) {
+        for (col = 0; col < tile_w; col++) {
             unsigned char packed = (unsigned char)(position + col);
             if (pic_mode == 7) {
                 unsigned char *value = &buf[packed >> 1];
@@ -919,21 +923,15 @@ static void layout_preview(void)
 static void draw_selector(void)
 {
     if (!loaded) return;
-    fx0 = scroll_x;
-    fx0 <<= 2;
-    if (tile_x < fx0 || tile_y < scroll_y) return;
-    fx1 = tile_x;
-    fx1 -= fx0;
-    fy0 = tile_y;
-    fy0 -= scroll_y;
-    if (fx1 + TILE_SIDE > (unsigned int)pv_view_w * 4U ||
-        fy0 + TILE_SIDE > pv_view_h) return;
-    fx0 = pv_image_x;
-    fx0 <<= 2;
-    fx0 += fx1;
-    fx1 = fx0 + TILE_SIDE - 1;
-    fy0 += pv_image_y;
-    fy1 = fy0 + TILE_SIDE - 1;
+    sel_px = ((unsigned int)pv_image_x - scroll_x) * 4 + tile_x;
+    sel_py = pv_image_y + tile_y - scroll_y;
+    if (tile_x < scroll_x * 4 || tile_y < scroll_y ||
+        sel_px + TILE_SIDE > (unsigned int)(pv_view_x + pv_view_w) * 4 ||
+        (unsigned int)sel_py + TILE_SIDE > pv_view_y + pv_view_h) return;
+    fx0 = sel_px;
+    fx1 = sel_px + TILE_SIDE - 1;
+    fy0 = sel_py;
+    fy1 = sel_py + TILE_SIDE - 1;
     fpen = 3;
     fw_frame();
 }
@@ -981,70 +979,102 @@ static void draw_preview(void)
     draw_selector();
 }
 
-static unsigned char mode1_solid(unsigned char pen)
+/* Edit snapshots live above the bank-transfer scratch, below the tool cache.
+ * They are used synchronously, never across event callbacks. */
+#define BEFORE ((unsigned char *)gb_copybuf + 3072)
+
+static unsigned char covered(unsigned char col, unsigned char row, unsigned char pane)
 {
-    return (unsigned char)(((pen & 1) ? 0xF0 : 0) |
-                           ((pen & 2) ? 0x0F : 0));
+    if (inside(tc_x, tc_y, TC_W, TC_H, col, row)) return 1;
+    if (pane == front_pane) return 0;
+    if (pane == PANE_WORK) return inside(pv_x, pv_y, PV_W, PV_H, col, row);
+    return work_visible && inside(wk_x, wk_y, WK_W, WK_H, col, row);
 }
 
-static void draw_work_bitmap(void)
-{
-    unsigned char sy, repeat, sx, p0, p1, value;
-#ifdef GB_MSX2
-    unsigned char n;
+#ifndef GB_MSX2
+#ifdef GB_PCW
+static const unsigned char solid[] = {0x55, 0xff, 0, 0xaa};
+#define LEFT_MASK 0xc0
+#define RIGHT_MASK 0x03
+#else
+static const unsigned char solid[] = {0, 0xf0, 0x0f, 0xff};
+#define LEFT_MASK 0x88
+#define RIGHT_MASK 0x11
 #endif
-    unsigned char *out = (unsigned char *)gb_copybuf;
-    unsigned char *source;
-#ifdef GB_MSX2
-    if (pic_mode == 7) {
-        for (sy = 0; sy < TILE_SIDE; sy++) {
-            out = (unsigned char *)gb_copybuf;
-            for (repeat = 0; repeat < WORK_SCALE; repeat++) {
-                source = &tile[(unsigned int)sy * TILE_SIDE];
-                for (sx = 0; sx < TILE_SIDE; sx++) {
-                    p0 = *source++;
-                    value = (unsigned char)((p0 << 4) | p0);
-                    for (n = 0; n < WORK_SCALE / 2; n++) *out++ = value;
-                }
-            }
-            native_blit((unsigned char)(wk_x + 1),
-                        (unsigned char)(wk_y + TITLE_H + sy * WORK_SCALE),
-                        WORK_WB, WORK_SCALE, (unsigned char *)gb_copybuf);
+#endif
+
+/* Generate one magnified row in transfer scratch. Only its first, middle and
+ * last scanlines differ: copy the repeated middle scanlines rather than
+ * unpacking each source pixel eight times. */
+static unsigned char run_x, run_end, run_y, run_pitch;
+static unsigned char *scan_pixels;
+static void work_scan(unsigned char *out, unsigned char row)
+{
+    unsigned char x, body, left, right;
+    for (x = run_x; x < run_end; ++x) {
+        body = !row && run_y ? 2 : scan_pixels[x];
+        left = x ? 2 : body;
+        right = body;
+        if (work_sel_on && x >= work_sel_x0 && x <= work_sel_x1 &&
+            run_y >= work_sel_y0 && run_y <= work_sel_y1) {
+            if ((!row && run_y == work_sel_y0) || (row == 7 && run_y == work_sel_y1))
+                body = left = right = 3;
+            if (x == work_sel_x0) left = 3;
+            if (x == work_sel_x1) right = 3;
         }
+#ifdef GB_MSX2
+        *out++ = (left << 4) | body;
+        *out++ = body * 17;
+        *out++ = body * 17;
+        *out++ = (body << 4) | right;
+#else
+        *out++ = (solid[left] & LEFT_MASK) | (solid[body] & ~LEFT_MASK);
+        *out++ = (solid[right] & RIGHT_MASK) | (solid[body] & ~RIGHT_MASK);
+#endif
+    }
+}
+
+#ifdef GB_MSX2
+#define WORK_BLIT native_blit
+#define NATIVE_BYTES 2
+#else
+#define WORK_BLIT gb_restorerect
+#define NATIVE_BYTES 1
+#endif
+
+static unsigned char overlap(unsigned char x, unsigned char y, unsigned char w,
+                             unsigned char h, unsigned char ox, unsigned char oy,
+                             unsigned char ow, unsigned char oh)
+{
+    return x < ox + ow && ox < x + w && y < oy + oh && oy < y + h;
+}
+
+static void draw_work_run(unsigned char first, unsigned char end, unsigned char y)
+{
+    unsigned char *buf = (unsigned char *)gb_copybuf, *out = buf;
+    unsigned char row, col, start;
+    unsigned char sx = wk_x + 1 + first * 2, sy = wk_y + TITLE_H + y * 8;
+    unsigned char width = (end - first) * 2;
+    run_x = first; run_end = end; run_y = y; run_pitch = width * NATIVE_BYTES;
+    scan_pixels = &tile[(unsigned int)y * TILE_SIDE];
+    for (row = 0; row < 8; ++row, out += run_pitch) {
+        if (row < 2 || row == 7) work_scan(out, row);
+        else memcpy(out, out - run_pitch, run_pitch);
+    }
+    if (!overlap(sx, sy, width, 8, tc_x, tc_y, TC_W, TC_H) &&
+        (front_pane == PANE_WORK || !overlap(sx, sy, width, 8, pv_x, pv_y, PV_W, PV_H))) {
+        WORK_BLIT(sx, sy, width, 8, buf);
         return;
     }
-#endif
-    for (sy = 0; sy < TILE_SIDE; sy++) {
-        out = (unsigned char *)gb_copybuf;
-        for (repeat = 0; repeat < WORK_SCALE; repeat++) {
-            source = &tile[(unsigned int)sy * TILE_SIDE];
-            for (sx = 0; sx < TILE_SIDE; sx += 2) {
-                p0 = *source++;
-                p1 = *source++;
-                value = mode1_solid(p0);
-                *out++ = value;
-                *out++ = value;
-                value = mode1_solid(p1);
-                *out++ = value;
-                *out++ = value;
-            }
+    for (row = 0; row < 8; ++row, ++sy, buf += run_pitch) {
+        col = 0;
+        while (col < width) {
+            while (col < width && covered(sx + col, sy, PANE_WORK)) ++col;
+            start = col;
+            while (col < width && !covered(sx + col, sy, PANE_WORK)) ++col;
+            if (col != start)
+                WORK_BLIT(sx + start, sy, col - start, 1, buf + start * NATIVE_BYTES);
         }
-        blit_mode1((unsigned char)(wk_x + 1),
-                   (unsigned char)(wk_y + TITLE_H + sy * WORK_SCALE),
-                   WORK_WB, WORK_SCALE, (unsigned char *)gb_copybuf, WORK_WB);
-    }
-}
-
-static void draw_work_grid(void)
-{
-    unsigned char i;
-    int left = (int)(wk_x + 1) * 4;
-    int top = wk_y + TITLE_H;
-    for (i = 1; i < TILE_SIDE; i++) {
-        line(left + i * WORK_SCALE, top,
-             left + i * WORK_SCALE, top + WORK_PIXELS - 1, 2);
-        line(left, top + i * WORK_SCALE,
-             left + WORK_PIXELS - 1, top + i * WORK_SCALE, 2);
     }
 }
 
@@ -1059,37 +1089,17 @@ static void normalize_work_selection(void)
     }
 }
 
-static void draw_work_selection(void)
+static void canvas_pixels(void)
 {
-    if (!work_sel_on) return;
-    fx0 = (unsigned int)(wk_x + 1);
-    fx0 <<= 2;
-    fx1 = work_sel_x0;
-    fx1 *= WORK_SCALE;
-    fx0 += fx1;
-    fy0 = (unsigned int)(wk_y + TITLE_H);
-    fy1 = work_sel_y0;
-    fy1 *= WORK_SCALE;
-    fy0 += fy1;
-    fx1 = (unsigned int)(work_sel_x1 - work_sel_x0 + 1);
-    fx1 *= WORK_SCALE;
-    fx1 += fx0;
-    fx1--;
-    fy1 = (unsigned int)(work_sel_y1 - work_sel_y0 + 1);
-    fy1 *= WORK_SCALE;
-    fy1 += fy0;
-    fy1--;
-    fpen = 3;
-    fw_frame();
+    unsigned char y;
+    for (y = 0; y < TILE_SIDE; ++y) draw_work_run(0, TILE_SIDE, y);
 }
 
 static void draw_work(void)
 {
     if (!work_visible) return;
-    gb_window(wk_x, wk_y, WK_W, (unsigned char)WK_H, "Canvas 8x");
-    draw_work_bitmap();
-    draw_work_grid();
-    draw_work_selection();
+    gb_window(wk_x, wk_y, WK_W, WK_H, "Canvas 8x");
+    canvas_pixels();
 }
 
 static void repaint_picture_panes(void)
@@ -1113,159 +1123,50 @@ static void repaint_all(void)
     gb_curshow();
 }
 
-static void draw_work_cell(unsigned char x, unsigned char y)
+static void draw_preview_pixel(unsigned char x, unsigned char y)
 {
-    unsigned char row;
-    int left = (int)(wk_x + 1) * 4 + x * WORK_SCALE;
-    int top = wk_y + TITLE_H + y * WORK_SCALE;
-    unsigned char pen = tile[(unsigned int)y * TILE_SIDE + x];
-    for (row = 0; row < WORK_SCALE; row++)
-    line(left, top + row, left + WORK_SCALE - 1, top + row, pen);
-    line(left, top, left + WORK_SCALE - 1, top, 2);
-    line(left, top, left, top + WORK_SCALE - 1, 2);
+    unsigned int px;
+    unsigned char py;
+    if (!x || !y || x == TILE_SIDE - 1 || y == TILE_SIDE - 1) return;
+    if (x >= tile_w || y >= tile_h) return;
+    px = sel_px + x;
+    py = sel_py + y;
+    if (!inside(pv_view_x,pv_view_y,pv_view_w,pv_view_h,px >> 2,py) ||
+        covered(px >> 2, py, PANE_PREVIEW)) return;
+    line(px, py, px, py, tile[(unsigned int)y * TILE_SIDE + x]);
 }
 
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-/* Paint one changed source pixel into the unobscured 1:1 preview. CPC cannot
- * retain a backing store for the three panes, so avoid touching pixels covered
- * by the foreground Canvas/Toolchest and leave the red navigator border alone. */
-static void draw_preview_pixel(unsigned char x, unsigned char y) __naked
+static void remember_pixels(void)
 {
-    x; y;
-__asm
-    ; SDCC passes x in A and y in L. Preserve both for the tile lookup.
-    ld   c,a
-    ld   b,l
-    or   a
-    ret  z
-    cp   #19
-    ret  z
-    ld   a,b
-    or   a
-    ret  z
-    cp   #19
-    ret  z
-
-    ; Logical preview X = image origin + tile X + cell X - byte scroll * 4.
-    ld   hl,(_scroll_x)
-    add  hl,hl
-    add  hl,hl
-    ex   de,hl
-    ld   hl,(_tile_x)
-    or   a
-    sbc  hl,de
-    ld   a,(_pv_image_x)
-    add  a,a
-    add  a,a
-    ld   e,a
-    ld   d,#0
-    add  hl,de
-    ld   e,c
-    ld   d,#0
-    add  hl,de
-    push hl                         ; logical X for pane-coverage tests
-    add  hl,hl                     ; CPC firmware X coordinate
-    ld   (_fx0),hl
-    ld   (_fx1),hl
-
-    ; Logical preview Y = image origin + tile Y + cell Y - line scroll.
-    ld   hl,(_tile_y)
-    ld   de,(_scroll_y)
-    or   a
-    sbc  hl,de
-    ld   a,(_pv_image_y)
-    add  a,l
-    add  a,b
-    ld   e,a                       ; E = logical Y
-    ld   a,#199
-    sub  e
-    ld   l,a
-    ld   h,#0
-    add  hl,hl                     ; CPC firmware Y coordinate
-    ld   (_fy0),hl
-    ld   (_fy1),hl
-
-    pop  hl                        ; byte column = logical X / 4
-    srl  h
-    rr   l
-    srl  h
-    rr   l
-    ld   d,l                       ; D = byte column, E = logical Y
-
-    ; Do not paint through the foreground Canvas.
-    ld   a,(_work_visible)
-    or   a
-    jr   z,dpv_tool
-    ld   a,(_front_pane)
-    dec  a
-    jr   nz,dpv_tool
-    ld   a,d
-    ld   hl,#_wk_x
-    cp   (hl)
-    jr   c,dpv_tool
-    ld   a,(hl)
-    add  a,#42
-    cp   d
-    jr   c,dpv_tool
-    jr   z,dpv_tool
-    ld   a,e
-    ld   hl,#_wk_y
-    cp   (hl)
-    jr   c,dpv_tool
-    ld   a,(hl)
-    add  a,#175
-    cp   e
-    ret  nc
-
-dpv_tool:
-    ; The Toolchest is always the topmost pane.
-    ld   a,d
-    ld   hl,#_tc_x
-    cp   (hl)
-    jr   c,dpv_draw
-    ld   a,(hl)
-    add  a,#29
-    cp   d
-    jr   c,dpv_draw
-    jr   z,dpv_draw
-    ld   a,e
-    ld   hl,#_tc_y
-    cp   (hl)
-    jr   c,dpv_draw
-    ld   a,(hl)
-    add  a,#126
-    cp   e
-    ret  nc
-
-dpv_draw:
-    ; pen = tile[y * 20 + x], then plot a zero-length firmware line.
-    ld   l,b
-    ld   h,#0
-    add  hl,hl
-    add  hl,hl
-    ld   e,l
-    ld   d,h
-    add  hl,hl
-    add  hl,hl
-    add  hl,de
-    ld   e,c
-    ld   d,#0
-    add  hl,de
-    ld   de,#_tile
-    add  hl,de
-    ld   a,(hl)
-    ld   (_fpen),a
-    call _fw_line
-    ret
-__endasm;
+    memcpy(BEFORE, tile, TILE_PIXELS);
 }
-#endif
+
+static void update_changes(unsigned char preview)
+{
+    unsigned char x, start, y;
+    unsigned int i = 0;
+    gb_curhide();
+    for (y = 0; y < TILE_SIDE; ++y) {
+        x = 0;
+        while (x < TILE_SIDE) {
+            if (BEFORE[i] == tile[i]) { ++i; ++x; continue; }
+            start = x;
+            do {
+                if (preview) draw_preview_pixel(x, y);
+                ++i; ++x;
+            } while (x < TILE_SIDE && BEFORE[i] != tile[i]);
+            draw_work_run(start, x, y);
+        }
+    }
+    gb_curshow();
+}
 
 /* ---- work tools ---------------------------------------------------------- */
 
 static void save_undo(void)
 {
     unsigned int i;
+    remember_pixels();
     for (i = 0; i < TILE_PACKED; i++)
         undo_tile[i] = (unsigned char)((tile[i << 1] << 4) |
                                       tile[(i << 1) + 1]);
@@ -1281,6 +1182,15 @@ static void restore_undo_base(void)
         tile[i << 1] = value >> 4;
         tile[(i << 1) + 1] = value & 15;
     }
+}
+
+static void live_pixel(unsigned char x, unsigned char y)
+{
+    unsigned char *p = &tile[(unsigned int)y * TILE_SIDE + x];
+    if (*p == current_pen) return;
+    *p = current_pen;
+    draw_work_run(x, x + 1, y);
+    draw_preview_pixel(x, y);
 }
 
 static void set_tile_pixel(signed char x, signed char y)
@@ -1299,13 +1209,8 @@ static void tile_line(signed char x0, signed char y0,
     signed char sy = y0 < y1 ? 1 : -1;
     signed char err = dx + dy;
     for (;;) {
-        set_tile_pixel(x0, y0);
-        if (live) {
-            draw_work_cell((unsigned char)x0, (unsigned char)y0);
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-            draw_preview_pixel((unsigned char)x0, (unsigned char)y0);
-#endif
-        }
+        if (live) live_pixel(x0, y0);
+        else set_tile_pixel(x0, y0);
         if (x0 == x1 && y0 == y1) break;
         {
             signed char twice = (signed char)(err << 1);
@@ -1384,42 +1289,103 @@ static void tile_circle(signed char cx, signed char cy,
     }
 }
 
-static void flood_fill(unsigned char x, unsigned char y)
+/* The target pen and frontier (0x80) are distinct from every replacement
+ * pen. Scan bounded tile pointers; no recursion or shared stack workspace.
+ * IX displacements keep neighbour addresses independent of SDCC spills. */
+static unsigned char fill_rows, fill_again;
+static void flood_fill(unsigned char x, unsigned char y) __naked
 {
-    unsigned int value, sp = 0;
-    unsigned char px, py;
-    unsigned char *stack = (unsigned char *)gb_copybuf;
-    unsigned char target = tile[(unsigned int)y * TILE_SIDE + x];
-    if (target == current_pen) return;
-    value = (unsigned int)y * TILE_SIDE + x;
-    tile[value] = current_pen;
-    stack[sp++] = x;
-    stack[sp++] = y;
-    while (sp) {
-        py = stack[--sp];
-        px = stack[--sp];
-        value = (unsigned int)py * TILE_SIDE + px;
-        if (px && tile[value - 1] == target) {
-            tile[value - 1] = current_pen;
-            stack[sp++] = px - 1;
-            stack[sp++] = py;
-        }
-        if (px + 1 < TILE_SIDE && tile[value + 1] == target) {
-            tile[value + 1] = current_pen;
-            stack[sp++] = px + 1;
-            stack[sp++] = py;
-        }
-        if (py && tile[value - TILE_SIDE] == target) {
-            tile[value - TILE_SIDE] = current_pen;
-            stack[sp++] = px;
-            stack[sp++] = py - 1;
-        }
-        if (py + 1 < TILE_SIDE && tile[value + TILE_SIDE] == target) {
-            tile[value + TILE_SIDE] = current_pen;
-            stack[sp++] = px;
-            stack[sp++] = py + 1;
-        }
-    }
+    x; y;
+__asm
+    push ix
+    ld e,l
+    ld d,#0
+    ld h,d
+    add hl,hl
+    add hl,hl
+    add hl,de
+    add hl,hl
+    add hl,hl
+    ld e,a
+    add hl,de
+    ld de,#_tile
+    add hl,de
+    ld a,(_current_pen)
+    cp (hl)
+    jp z,ff_done
+    ld b,(hl)                  ; target ink
+    ld (hl),#0x80              ; caller checked the seed is inside the picture
+    ld a,(_tile_w)
+    ld c,a
+ff_sweep:
+    ld ix,#_tile
+    xor a
+    ld (_fill_again),a
+    ld a,(_tile_h)
+    ld (_fill_rows),a
+ff_row:
+    ld e,c
+ff_pixel:
+    bit 7,0(ix)
+    jr z,ff_next
+    ld a,(_current_pen)
+    ld 0(ix),a
+    ld a,e
+    cp c
+    jr z,ff_right
+    ld a,-1(ix)
+    cp b
+    jr nz,ff_right
+    ld -1(ix),#0x80
+    ld a,#1
+    ld (_fill_again),a
+ff_right:
+    ld a,e
+    dec a
+    jr z,ff_up
+    ld a,1(ix)
+    cp b
+    jr nz,ff_up
+    ld 1(ix),#0x80
+ff_up:
+    ld a,(_tile_h)
+    ld d,a
+    ld a,(_fill_rows)
+    cp d
+    jr z,ff_down
+    ld a,-20(ix)
+    cp b
+    jr nz,ff_down
+    ld -20(ix),#0x80
+    ld a,#1
+    ld (_fill_again),a
+ff_down:
+    ld a,(_fill_rows)
+    dec a
+    jr z,ff_next
+    ld a,20(ix)
+    cp b
+    jr nz,ff_next
+    ld 20(ix),#0x80
+ff_next:
+    inc ix
+    dec e
+    jr nz,ff_pixel
+    ld a,#20
+    sub c
+    ld e,a
+    ld d,#0
+    add ix,de
+    ld hl,#_fill_rows
+    dec (hl)
+    jr nz,ff_row
+    ld a,(_fill_again)
+    or a
+    jr nz,ff_sweep
+ff_done:
+    pop ix
+    ret
+__endasm;
 }
 
 static unsigned char next_random(void)
@@ -1438,22 +1404,24 @@ static void spray_at(unsigned char x, unsigned char y)
         int px = (int)x + dx;
         int py = (int)y + dy;
         if (px >= 0 && px < TILE_SIDE && py >= 0 && py < TILE_SIDE) {
-            set_tile_pixel(px, py);
-            draw_work_cell((unsigned char)px, (unsigned char)py);
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-            draw_preview_pixel((unsigned char)px, (unsigned char)py);
-#endif
+            live_pixel(px, py);
         }
     }
 }
 
+static void refresh_tool_title(void)
+{
+    gb_curhide();
+    gb_window(tc_x, tc_y, TC_W, TITLE_H, tool_title());
+    gb_curshow();
+}
+
 static void finish_change(void)
 {
+    unsigned char was_dirty = dirty;
     if (!commit_tile()) gb_alert("Paint error", "Could not write tile");
-    if (stroke_active) return;
-    gb_curhide();
-    repaint_picture_panes();
-    gb_curshow();
+    if (!stroke_active) update_changes(1);
+    if (dirty != was_dirty) refresh_tool_title();
 }
 
 static void do_undo(void)
@@ -1461,6 +1429,7 @@ static void do_undo(void)
     unsigned int i;
     unsigned char value, replacement;
     if (!work_visible || !undo_valid) return;
+    remember_pixels();
     for (i = 0; i < TILE_PACKED; i++) {
         value = undo_tile[i];
         replacement = (unsigned char)((tile[i << 1] << 4) |
@@ -1575,38 +1544,47 @@ static void drag_shape(unsigned char sx, unsigned char sy)
         work_point(&nx, &ny, 1);
         if (nx == ex && ny == ey) continue;
         ex = nx; ey = ny;
+        remember_pixels();
         restore_undo_base();
         apply_shape(sx, sy, ex, ey);
-        gb_curhide();
-        draw_work();
-        gb_curshow();
+        update_changes(1);
     }
+    remember_pixels();
     restore_undo_base();
     apply_shape(sx, sy, ex, ey);
     finish_change();
 }
 
+/* Invalidate only the cells along the old and new selection outlines. */
+static void mark_selection(void)
+{
+    unsigned char x, y;
+    if (!work_sel_on) return;
+    for (y = work_sel_y0; y <= work_sel_y1; ++y)
+        for (x = work_sel_x0; x <= work_sel_x1; ++x)
+            if (x == work_sel_x0 || x == work_sel_x1 ||
+                y == work_sel_y0 || y == work_sel_y1)
+                BEFORE[(unsigned int)y * TILE_SIDE + x] = 0xff;
+}
+
 static void drag_work_selection(unsigned char sx, unsigned char sy)
 {
-    unsigned char nx = sx, ny = sy, flags;
-    work_sel_on = 1;
-    work_sel_x0 = work_sel_x1 = sx;
-    work_sel_y0 = work_sel_y1 = sy;
-    for (;;) {
-        flags = gb_poll();
-        if (!(flags & GB_FIRE)) break;
-        work_point(&nx, &ny, 1);
-        if (nx == work_sel_x1 && ny == work_sel_y1) continue;
-        work_sel_x1 = nx;
-        work_sel_y1 = ny;
-        gb_curhide();
-        draw_work();
-        gb_curshow();
-    }
-    work_sel_x1 = nx;
-    work_sel_y1 = ny;
-    normalize_work_selection();
-    gb_restore_parent();
+    unsigned char nx = sx, ny = sy, x, y;
+    do {
+        remember_pixels();
+        mark_selection();
+        work_sel_on = 1;
+        work_sel_x0 = sx; work_sel_y0 = sy;
+        work_sel_x1 = nx; work_sel_y1 = ny;
+        normalize_work_selection();
+        mark_selection();
+        update_changes(0);
+        do {
+            if (!(gb_poll() & GB_FIRE)) return;
+            work_point(&x, &y, 1);
+        } while (x == nx && y == ny);
+        nx = x; ny = y;
+    } while (1);
 }
 
 static void start_work_action(void)
@@ -1618,6 +1596,8 @@ static void start_work_action(void)
         return;
     }
     if (current_tool == TOOL_BUCKET) {
+        if (x >= tile_w || y >= tile_h ||
+            tile[(unsigned int)y * TILE_SIDE + x] == current_pen) return;
         save_undo();
         flood_fill(x, y);
         finish_change();
@@ -1635,11 +1615,7 @@ static void start_work_action(void)
         stroke_x = x; stroke_y = y;
         gb_curhide();
         if (current_tool == TOOL_PENCIL) {
-            set_tile_pixel(x, y);
-            draw_work_cell(x, y);
-#if !defined(GB_MSX2) && !defined(GB_PCW)
-            draw_preview_pixel(x, y);
-#endif
+            live_pixel(x, y);
         } else spray_at(x, y);
         gb_curshow();
     }
@@ -1651,9 +1627,7 @@ static void continue_stroke(void)
     if (!(gb_flags() & GB_FIRE)) {
         finish_change();
         stroke_active = 0;
-#if defined(GB_MSX2) || defined(GB_PCW)
-        refresh_preview_selection();
-#endif
+
         return;
     }
     work_point(&x, &y, 1);
@@ -1672,184 +1646,90 @@ static void continue_stroke(void)
 
 /* ---- preview interaction ------------------------------------------------- */
 
-static unsigned char selector_screen(int *left, int *top)
+/* Only repaint an overlying pane if a newly drawn window actually covers it. */
+static void preview_front(void)
 {
-    int relx, rely;
-    layout_preview();
-    relx = (int)tile_x - (int)(scroll_x * 4U);
-    rely = (int)tile_y - (int)scroll_y;
-    *left = (int)pv_image_x * 4 + relx;
-    *top = pv_image_y + rely;
-    return (unsigned char)(relx >= 0 && rely >= 0 &&
-        relx + TILE_SIDE <= (int)pv_view_w * 4 &&
-        rely + TILE_SIDE <= pv_view_h);
+    draw_preview();
+    if (overlap(pv_x,pv_y,PV_W,PV_H,tc_x,tc_y,TC_W,TC_H)) draw_toolchest();
 }
 
-#if defined(GB_MSX2) || defined(GB_PCW)
-static void refresh_preview_selection(void) __naked
+static void canvas_front(void)
 {
-__asm
-    ; clip x = preview x + floor(tile x / 4) - horizontal byte scroll
-    ld   hl, (_tile_x)
-    srl  h
-    rr   l
-    srl  h
-    rr   l
-    ld   de, (_scroll_x)
-    or   a
-    sbc  hl, de
-    ld   a, (_pv_image_x)
-    add  a, l
-    ld   b, a
-    add  a, #6
-    ld   c, a
-
-    ; App panes have no backing store. If either foreground pane begins
-    ; within this patch, leave the hidden preview to the next normal repaint.
-    ld   a, (_wk_x)
-    cp   c
-    ret  c
-    ret  z
-    ld   a, (_tc_x)
-    cp   c
-    ret  c
-    ret  z
-
-    ; Hide under the old full clip, then restrict all preview drawing to the
-    ; six byte-columns that cover an arbitrarily aligned 20-pixel selector.
-    push bc
-    call _gb_curhide
-    pop  bc
-    ld   a, b
-    ld   (0x1338), a
-    ld   hl, (_tile_y)
-    ld   de, (_scroll_y)
-    or   a
-    sbc  hl, de
-    ld   a, (_pv_image_y)
-    add  a, l
-    ld   (0x1339), a
-    ld   hl, #0x1406
-    ld   (0x133a), hl
-    call _draw_preview
-
-    xor  a
-    ld   (0x1338), a
-    ld   (0x1339), a
-__endasm;
-#ifdef GB_MSX2
-__asm
-    ld   hl, #0xd480
-__endasm;
-#else
-__asm
-    ld   hl, #0xf85a
-__endasm;
-#endif
-__asm
-    ld   (0x133a), hl
-    call _gb_curshow
-    ret
-__endasm;
+    draw_work();
+    if (overlap(wk_x,wk_y,WK_W,WK_H,tc_x,tc_y,TC_W,TC_H)) draw_toolchest();
 }
-#endif
 
-static void clamp_tile_origin(void)
+static void focus_pane(unsigned char pane)
 {
-    unsigned int maxx = pic_width > TILE_SIDE ? pic_width - TILE_SIDE : 0;
-    unsigned int maxy = pic_height > TILE_SIDE ? pic_height - TILE_SIDE : 0;
-    if (tile_x > maxx) tile_x = maxx;
-    if (tile_y > maxy) tile_y = maxy;
+    if (pane == front_pane) return;
+    front_pane = pane;
+    if (!work_visible || !overlap(wk_x,wk_y,WK_W,WK_H,pv_x,pv_y,PV_W,PV_H)) return;
+    gb_curhide();
+    if (pane == PANE_WORK) canvas_front(); else preview_front();
+    gb_curshow();
+}
+
+static unsigned int clamp_origin(int pos, unsigned int size)
+{
+    unsigned int limit = size > TILE_SIDE ? size - TILE_SIDE : 0;
+    if (pos < 0) return 0;
+    return (unsigned int)pos > limit ? limit : (unsigned int)pos;
 }
 
 static void drag_selector(void)
 {
-    int left, top, px, py, nx, ny;
-    int grabx = TILE_SIDE / 2, graby = TILE_SIDE / 2;
-    unsigned char flags;
-    unsigned int source_x, source_y;
-
-    layout_preview();
-    px = (int)gb_mxp();
-    py = gb_my();
-    if (selector_screen(&left, &top) &&
-        px >= left && px < left + TILE_SIDE &&
-        py >= top && py < top + TILE_SIDE) {
-        grabx = px - left;
-        graby = py - top;
-    } else {
-        source_x = scroll_x * 4U +
-                   (unsigned int)(px - (int)pv_image_x * 4);
-        source_y = scroll_y + (unsigned int)(py - pv_image_y);
-        tile_x = source_x > TILE_SIDE / 2 ?
-                 source_x - TILE_SIDE / 2 : 0;
-        tile_y = source_y > TILE_SIDE / 2 ?
-                 source_y - TILE_SIDE / 2 : 0;
-        clamp_tile_origin();
-    }
-    for (;;) {
-        flags = gb_poll();
-        if (!(flags & GB_FIRE)) break;
-        px = (int)gb_mxp() - (int)pv_image_x * 4 - grabx;
-        py = (int)gb_my() - pv_image_y - graby;
-        nx = (int)(scroll_x * 4U) + px;
-        ny = (int)scroll_y + py;
-        if (nx < 0) nx = 0;
-        if (ny < 0) ny = 0;
-        if ((unsigned int)nx == tile_x && (unsigned int)ny == tile_y) continue;
-        tile_x = (unsigned int)nx;
-        tile_y = (unsigned int)ny;
-        clamp_tile_origin();
-        gb_curhide();
-        draw_preview();
-        draw_toolchest();
-        gb_curshow();
-    }
-    if (!load_tile()) {
+    int dx = (int)gb_mxp() - (int)sel_px;
+    int dy = (int)gb_my() - sel_py;
+    unsigned int nx, ny;
+    unsigned char moved = 0;
+    if (dx < 0 || dx >= TILE_SIDE || dy < 0 || dy >= TILE_SIDE)
+        dx = dy = TILE_SIDE / 2;
+    dx += (int)pv_image_x * 4 - (int)scroll_x * 4;
+    dy += (int)pv_image_y - (int)scroll_y;
+    do {
+        nx = clamp_origin((int)gb_mxp() - dx, pic_width);
+        ny = clamp_origin((int)gb_my() - dy, pic_height);
+        if (nx != tile_x || ny != tile_y) {
+            tile_x = nx; tile_y = ny;
+            moved = 1;
+            gb_curhide(); preview_front(); gb_curshow();
+        }
+    } while (gb_poll() & GB_FIRE);
+    if ((!work_visible || moved) && !load_tile()) {
         gb_alert("Paint error", "Could not read tile");
         return;
     }
-    work_visible = 1;
-    front_pane = PANE_WORK;
-    repaint_all();                  /* New canvas covers, but never exposes, other apps. */
+    if (!work_visible) {
+        front_pane = PANE_WORK;
+        work_visible = 1;
+        gb_curhide(); canvas_front(); gb_curshow();
+    } else if (moved) {
+        gb_curhide(); canvas_pixels(); gb_curshow();
+    }
 }
 
-static void drag_vscroll(void)
+static void drag_scroll(unsigned char horizontal)
 {
     unsigned int value;
-    unsigned char flags;
+    unsigned char moved = 0;
     do {
-        value = scroll_value(pv_view_y, pv_view_h,
-                             pic_height, pv_view_h, gb_my());
-        if (value != scroll_y) {
-            tile_y += value - scroll_y;
-            scroll_y = value;
-            clamp_tile_origin();
-            gb_curhide(); draw_preview(); draw_toolchest(); gb_curshow();
-        }
-        flags = gb_poll();
-    } while (flags & GB_FIRE);
-    load_tile();
-    gb_restore_parent();
-}
-
-static void drag_hscroll(void)
-{
-    unsigned int value;
-    unsigned char flags;
-    do {
-        value = scroll_value(pv_hbar_x, pv_hbar_w,
-                             pic_wb, pv_view_w, gb_mx());
-        if (value != scroll_x) {
-            tile_x += (value - scroll_x) << 2;
+        if (horizontal) {
+            value = scroll_value(pv_hbar_x, pv_hbar_w, pic_wb, pv_view_w, gb_mx());
+            if (value == scroll_x) continue;
+            tile_x = clamp_origin((int)tile_x + ((int)value - (int)scroll_x) * 4, pic_width);
             scroll_x = value;
-            clamp_tile_origin();
-            gb_curhide(); draw_preview(); draw_toolchest(); gb_curshow();
+        } else {
+            value = scroll_value(pv_view_y, pv_view_h, pic_height, pv_view_h, gb_my());
+            if (value == scroll_y) continue;
+            tile_y = clamp_origin((int)tile_y + ((int)value - (int)scroll_y), pic_height);
+            scroll_y = value;
         }
-        flags = gb_poll();
-    } while (flags & GB_FIRE);
-    load_tile();
-    gb_restore_parent();
+        moved = 1;
+        gb_curhide(); preview_front(); gb_curshow();
+    } while (gb_poll() & GB_FIRE);
+    if (moved && work_visible && load_tile()) {
+        gb_curhide(); canvas_pixels(); gb_curshow();
+    }
 }
 
 /* ---- files --------------------------------------------------------------- */
@@ -2495,8 +2375,12 @@ static void tool_action(unsigned char index)
     else if (index == TOOL_COPY) copy_selection();
     else if (index == TOOL_PASTE) paste_selection();
     else {
+        if (index == current_tool) return;
+        gb_curhide();
+        gb_frame(tool_x(current_tool), tool_y(current_tool), TOOL_WB, TOOL_H, 2);
         current_tool = index;
-        gb_curhide(); draw_toolchest(); gb_curshow();
+        gb_frame(tool_x(index), tool_y(index), TOOL_WB, TOOL_H, 3);
+        gb_curshow();
     }
 }
 
@@ -2536,7 +2420,7 @@ static void toolchest_click(unsigned char mx, unsigned char my)
 
 static void preview_click(unsigned char mx, unsigned char my)
 {
-    front_pane = PANE_PREVIEW;
+    focus_pane(PANE_PREVIEW);
     if (title_hit(pv_x, pv_y, PV_W, mx, my)) {
         if (close_hit(pv_x, pv_y, mx, my)) {
             unsigned char action = confirm_discard(AFTER_CLOSE_DOC);
@@ -2550,11 +2434,11 @@ static void preview_click(unsigned char mx, unsigned char my)
     layout_preview();
     if (inside((unsigned char)(pv_x + 1), pv_view_y, SB_W, pv_view_h,
                mx, my)) {
-        drag_vscroll();
+        drag_scroll(0);
         return;
     }
     if (inside(pv_hbar_x, pv_hbar_y, pv_hbar_w, HSB_H, mx, my)) {
-        drag_hscroll();
+        drag_scroll(1);
         return;
     }
     if (my >= pv_image_y && my < (unsigned char)(pv_image_y + pv_view_h) &&
@@ -2565,7 +2449,7 @@ static void preview_click(unsigned char mx, unsigned char my)
 
 static void work_click(unsigned char mx, unsigned char my)
 {
-    front_pane = PANE_WORK;
+    focus_pane(PANE_WORK);
     if (title_hit(wk_x, wk_y, WK_W, mx, my)) {
         if (close_hit(wk_x, wk_y, mx, my)) {
             work_visible = 0;
